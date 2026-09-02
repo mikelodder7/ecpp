@@ -1,0 +1,46 @@
+[package]
+name = "ecpp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+authors = ["Michael Lodder <redmike7@gmail.com>"]
+description = "Backend-neutral elliptic curve primality proving"
+repository = "https://github.com/mikelodder7/ecpp"
+license = "Apache-2.0 OR MIT"
+keywords = ["primality", "ecpp", "elliptic-curve", "bigint", "cryptography"]
+categories = ["cryptography", "algorithms", "mathematics"]
+readme = "README.md"
+
+[features]
+default = ["std", "getrandom", "crypto-bigint"]
+std = ["num-bigint/std", "num-integer/std", "num-traits/std"]
+getrandom = ["dep:getrandom"]
+crypto-bigint = ["dep:crypto-bigint"]
+openssl = ["dep:openssl"]
+rug = ["dep:rug"]
+serde = ["dep:serde"]
+
+[dependencies]
+crypto-bigint = { version = "0.7.5", default-features = false, features = ["alloc"], optional = true }
+getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
+num-bigint = { version = "0.5", default-features = false }
+num-integer = { version = "0.1", default-features = false }
+num-traits = { version = "0.2", default-features = false }
+openssl = { version = "0.10.75", optional = true }
+rand_core = "0.10"
+rug = { version = "1.28", default-features = false, features = ["integer"], optional = true }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+rand = "0.10"
+serde_cbor_2 = "0.13"
+serde_json = "1"
+toml = "1.1"
+yaml_serde = "0.10"
+
+[package.metadata.docs.rs]
+all-features = false
+features = ["std", "getrandom", "crypto-bigint", "openssl", "rug", "serde"]
+rustdoc-args = ["--cfg", "docsrs"]
