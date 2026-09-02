@@ -4,9 +4,7 @@ use core::cmp::Ordering;
 
 use rand_core::CryptoRng;
 
-use crate::arithmetic::{
-    ArithmeticBackend, bit, bit_length, cmp_u64, from_u64, from_u128, is_even, to_u64,
-};
+use crate::arithmetic::{ArithmeticBackend, cmp_u64, from_u64, from_u128, to_u64};
 use crate::cm::{ClassPolynomial, DISCRIMINANTS};
 use crate::{Error, PrimalityProof, ProofNode, Result};
 
@@ -75,20 +73,6 @@ fn modular_mul<B: ArithmeticBackend>(left: &B, right: &B, modulus: &B) -> Result
     rem::<B>(&mul::<B>(left, right)?, modulus)
 }
 
-fn modular_pow<B: ArithmeticBackend>(base: &B, exponent: &B, modulus: &B) -> Result<B> {
-    let mut output = one::<B>()?;
-    let mut base = rem::<B>(base, modulus)?;
-    let mut index = 0;
-    while index < crate::arithmetic::bit_length::<B>(exponent) {
-        if bit::<B>(exponent, index) {
-            output = modular_mul::<B>(&output, &base, modulus)?;
-        }
-        base = modular_mul::<B>(&base, &base, modulus)?;
-        index += 1;
-    }
-    Ok(output)
-}
-
 fn modular_signed<B: ArithmeticBackend>(value: i128, modulus: &B) -> Result<B> {
     let magnitude = rem::<B>(&from_u128::<B>(value.unsigned_abs())?, modulus)?;
     if value >= 0 || is_zero::<B>(&magnitude)? {
@@ -98,44 +82,11 @@ fn modular_signed<B: ArithmeticBackend>(value: i128, modulus: &B) -> Result<B> {
     }
 }
 
-fn gcd<B: ArithmeticBackend>(left: &B, right: &B) -> Result<B> {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    while !is_zero::<B>(&right)? {
-        let remainder = rem::<B>(&left, &right)?;
-        left = right;
-        right = remainder;
-    }
-    Ok(left)
-}
-
-fn modular_inverse<B: ArithmeticBackend>(value: &B, modulus: &B) -> Result<B> {
-    let mut coefficient = zero::<B>()?;
-    let mut next_coefficient = one::<B>()?;
-    let mut remainder = modulus.clone();
-    let mut next_remainder = rem::<B>(value, modulus)?;
-    while !is_zero::<B>(&next_remainder)? {
-        let quotient = div::<B>(&remainder, &next_remainder)?;
-        let old_coefficient = coefficient;
-        coefficient = next_coefficient;
-        let product = rem::<B>(&mul::<B>(&quotient, &coefficient)?, modulus)?;
-        next_coefficient = modular_sub::<B>(&old_coefficient, &product, modulus)?;
-        let old_remainder = remainder;
-        let following_remainder = sub::<B>(&old_remainder, &mul::<B>(&quotient, &next_remainder)?)?;
-        remainder = next_remainder;
-        next_remainder = following_remainder;
-    }
-    if remainder != one::<B>()? {
-        return Err(Error::Composite);
-    }
-    Ok(coefficient)
-}
-
 fn integer_sqrt<B: ArithmeticBackend>(value: &B) -> Result<B> {
     if cmp_u64::<B>(value, 2)? == Ordering::Less {
         return Ok(value.clone());
     }
-    let shift = crate::arithmetic::bit_length::<B>(value).div_ceil(2);
+    let shift = value.bit_length().div_ceil(2);
     let mut estimate = shl::<B>(&one::<B>()?, shift)?;
     loop {
         let next = shr::<B>(&add::<B>(&estimate, &div::<B>(value, &estimate)?)?, 1)?;
@@ -151,35 +102,6 @@ fn is_square<B: ArithmeticBackend>(value: &B) -> Result<Option<B>> {
     Ok((mul::<B>(&root, &root)? == *value).then_some(root))
 }
 
-fn jacobi<B: ArithmeticBackend>(value: &B, modulus: &B) -> Result<i8> {
-    if is_zero::<B>(modulus)? || is_even::<B>(modulus) {
-        return Ok(0);
-    }
-    let mut value = rem::<B>(value, modulus)?;
-    let mut modulus = modulus.clone();
-    let mut result = 1i8;
-    while !is_zero::<B>(&value)? {
-        while is_even::<B>(&value) {
-            value = shr::<B>(&value, 1)?;
-            let reduced = rem::<B>(&modulus, &from_u64::<B>(8)?)?;
-            let residue = to_u64::<B>(&reduced).unwrap_or(0);
-            if residue == 3 || residue == 5 {
-                result = -result;
-            }
-        }
-        core::mem::swap(&mut value, &mut modulus);
-        let value_mod_four = rem::<B>(&value, &from_u64::<B>(4)?)?;
-        let modulus_mod_four = rem::<B>(&modulus, &from_u64::<B>(4)?)?;
-        if cmp_u64::<B>(&value_mod_four, 3)? == Ordering::Equal
-            && cmp_u64::<B>(&modulus_mod_four, 3)? == Ordering::Equal
-        {
-            result = -result;
-        }
-        value = rem::<B>(&value, &modulus)?;
-    }
-    Ok(if modulus == one::<B>()? { result } else { 0 })
-}
-
 fn modular_sqrt<B: ArithmeticBackend>(value: &B, modulus: &B) -> Result<Option<B>> {
     let value = rem::<B>(value, modulus)?;
     if is_zero::<B>(&value)? {
@@ -188,32 +110,32 @@ fn modular_sqrt<B: ArithmeticBackend>(value: &B, modulus: &B) -> Result<Option<B
     if cmp_u64::<B>(modulus, 2)? == Ordering::Equal {
         return Ok(Some(value));
     }
-    if jacobi::<B>(&value, modulus)? != 1 {
+    if value.jacobi(modulus)? != 1 {
         return Ok(None);
     }
     let modulus_mod_four = rem::<B>(modulus, &from_u64::<B>(4)?)?;
     if cmp_u64::<B>(&modulus_mod_four, 3)? == Ordering::Equal {
         let exponent = shr::<B>(&add_u64::<B>(modulus, 1)?, 2)?;
-        return Ok(Some(modular_pow::<B>(&value, &exponent, modulus)?));
+        return Ok(Some(value.modular_pow(&exponent, modulus)?));
     }
 
     let mut odd = sub::<B>(modulus, &one::<B>()?)?;
     let mut exponent = 0u32;
-    while is_even::<B>(&odd) {
+    while odd.is_even() {
         odd = shr::<B>(&odd, 1)?;
         exponent += 1;
     }
     let mut non_residue = from_u64::<B>(2)?;
-    while jacobi::<B>(&non_residue, modulus)? != -1 {
+    while non_residue.jacobi(modulus)? != -1 {
         non_residue = add_u64::<B>(&non_residue, 1)?;
         if &non_residue >= modulus {
             return Ok(None);
         }
     }
-    let mut c = modular_pow::<B>(&non_residue, &odd, modulus)?;
+    let mut c = non_residue.modular_pow(&odd, modulus)?;
     let x_exponent = shr::<B>(&add_u64::<B>(&odd, 1)?, 1)?;
-    let mut x = modular_pow::<B>(&value, &x_exponent, modulus)?;
-    let mut t = modular_pow::<B>(&value, &odd, modulus)?;
+    let mut x = value.modular_pow(&x_exponent, modulus)?;
+    let mut t = value.modular_pow(&odd, modulus)?;
     let mut m = exponent;
     while t != one::<B>()? {
         let mut i = 1u32;
@@ -226,7 +148,7 @@ fn modular_sqrt<B: ArithmeticBackend>(value: &B, modulus: &B) -> Result<Option<B
             }
         }
         let two_power = shl::<B>(&one::<B>()?, (m - i - 1) as usize)?;
-        let b = modular_pow::<B>(&c, &two_power, modulus)?;
+        let b = c.modular_pow(&two_power, modulus)?;
         x = modular_mul::<B>(&x, &b, modulus)?;
         let b_squared = modular_mul::<B>(&b, &b, modulus)?;
         t = modular_mul::<B>(&t, &b_squared, modulus)?;
@@ -267,7 +189,7 @@ fn is_probable_prime<B: ArithmeticBackend>(candidate: &B, primes: &[u32]) -> Res
             return Ok(false);
         }
     }
-    if is_even::<B>(candidate) {
+    if candidate.is_even() {
         return Ok(false);
     }
     for base in [
@@ -288,11 +210,11 @@ fn miller_rabin<B: ArithmeticBackend>(candidate: &B, base: &B) -> Result<bool> {
     let minus_one = sub::<B>(candidate, &one)?;
     let mut odd = minus_one.clone();
     let mut exponent = 0u32;
-    while is_even::<B>(&odd) {
+    while odd.is_even() {
         odd = shr::<B>(&odd, 1)?;
         exponent += 1;
     }
-    let mut value = modular_pow::<B>(base, &odd, candidate)?;
+    let mut value = base.modular_pow(&odd, candidate)?;
     if value == one || value == minus_one {
         return Ok(true);
     }
@@ -351,7 +273,7 @@ fn cornacchia<B: ArithmeticBackend>(candidate: &B, discriminant: i16) -> Result<
         return Ok(None);
     };
     let expected_odd = absolute & 1 == 1;
-    if bit::<B>(&root, 0) != expected_odd {
+    if root.bit(0) != expected_odd {
         root = sub::<B>(candidate, &root)?;
     }
     let mut previous = shl::<B>(candidate, 1)?;
@@ -451,19 +373,11 @@ fn point_add<B: ArithmeticBackend>(
         let denominator = rem::<B>(&mul_u64::<B>(y1, 2)?, modulus)?;
         let x_squared = mul::<B>(x1, x1)?;
         let numerator = add::<B>(&mul_u64::<B>(&x_squared, 3)?, &curve.a)?;
-        modular_mul::<B>(
-            &numerator,
-            &modular_inverse::<B>(&denominator, modulus)?,
-            modulus,
-        )?
+        modular_mul::<B>(&numerator, &denominator.modular_inverse(modulus)?, modulus)?
     } else {
         let numerator = modular_sub::<B>(y2, y1, modulus)?;
         let denominator = modular_sub::<B>(x2, x1, modulus)?;
-        modular_mul::<B>(
-            &numerator,
-            &modular_inverse::<B>(&denominator, modulus)?,
-            modulus,
-        )?
+        modular_mul::<B>(&numerator, &denominator.modular_inverse(modulus)?, modulus)?
     };
     let slope_squared = modular_mul::<B>(&slope, &slope, modulus)?;
     let x3 = modular_sub::<B>(&modular_sub::<B>(&slope_squared, x1, modulus)?, x2, modulus)?;
@@ -483,11 +397,12 @@ fn scalar_mul<B: ArithmeticBackend>(
 ) -> Result<AffinePoint<B>> {
     let mut output = AffinePoint::Infinity;
     let mut addend = point.clone();
-    for index in 0..crate::arithmetic::bit_length::<B>(scalar) {
-        if bit::<B>(scalar, index) {
+    let bits = scalar.bit_length();
+    for index in 0..bits {
+        if scalar.bit(index) {
             output = point_add::<B>(curve, modulus, &output, &addend)?;
         }
-        if index + 1 < crate::arithmetic::bit_length::<B>(scalar) {
+        if index + 1 < bits {
             addend = point_add::<B>(curve, modulus, &addend, &addend)?;
         }
     }
@@ -735,7 +650,7 @@ fn pollard_rho<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
     value: &B,
     rng: &mut R,
 ) -> Result<Option<B>> {
-    if is_even::<B>(value) {
+    if value.is_even() {
         return Ok(Some(from_u64::<B>(2)?));
     }
     let one = one::<B>()?;
@@ -769,7 +684,7 @@ fn pollard_rho<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
                     };
                     product = rem::<B>(&mul::<B>(&product, &difference)?, value)?;
                 }
-                divisor = gcd::<B>(&product, value)?;
+                divisor = product.gcd(value)?;
                 offset += count;
                 iterations += count;
             }
@@ -784,7 +699,7 @@ fn pollard_rho<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
                 } else {
                     sub::<B>(&saved_y, &x)?
                 };
-                divisor = gcd::<B>(&difference, value)?;
+                divisor = difference.gcd(value)?;
                 iterations += 1;
             }
         }
@@ -797,7 +712,7 @@ fn pollard_rho<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
 
 fn curve_from_j<B: ArithmeticBackend>(candidate: &B, invariant: &B) -> Result<AffineCurve<B>> {
     let denominator = modular_sub::<B>(&from_u64::<B>(1728)?, invariant, candidate)?;
-    let inverse = modular_inverse::<B>(&denominator, candidate)?;
+    let inverse = denominator.modular_inverse(candidate)?;
     let k = modular_mul::<B>(invariant, &inverse, candidate)?;
     Ok(AffineCurve {
         a: rem::<B>(&mul_u64::<B>(&k, 3)?, candidate)?,
@@ -810,7 +725,7 @@ fn quadratic_twist<B: ArithmeticBackend>(
     curve: &AffineCurve<B>,
 ) -> Result<AffineCurve<B>> {
     let mut non_residue = from_u64::<B>(2)?;
-    while jacobi::<B>(&non_residue, candidate)? != -1 {
+    while non_residue.jacobi(candidate)? != -1 {
         non_residue = add_u64::<B>(&non_residue, 1)?;
         if &non_residue >= candidate {
             return Err(Error::Composite);
@@ -861,8 +776,9 @@ fn random_below<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
     modulus: &B,
     rng: &mut R,
 ) -> Result<B> {
-    let byte_length = bit_length::<B>(modulus).div_ceil(8);
-    let excess = byte_length * 8 - bit_length::<B>(modulus);
+    let bits = modulus.bit_length();
+    let byte_length = bits.div_ceil(8);
+    let excess = byte_length * 8 - bits;
     loop {
         let mut bytes = vec![0u8; byte_length];
         rng.fill_bytes(&mut bytes);
@@ -961,7 +877,7 @@ fn verify_step<B: ArithmeticBackend>(step: &crate::EcppStep, expected: Option<&B
     if expected.is_some_and(|value| value != &n) {
         return Err(Error::InvalidProof("certificate chain is disconnected"));
     }
-    if is_even::<B>(&n)
+    if n.is_even()
         || cmp_u64::<B>(&n, 3)? == Ordering::Less
         || q >= n
         || cmp_u64::<B>(&q, 2)? == Ordering::Less
@@ -998,7 +914,7 @@ fn verify_step<B: ArithmeticBackend>(step: &crate::EcppStep, expected: Option<&B
         &add::<B>(&mul_u64::<B>(&a_cubed, 4)?, &mul_u64::<B>(&b_squared, 27)?)?,
         &n,
     )?;
-    if gcd::<B>(&discriminant, &n)? != one::<B>()? {
+    if discriminant.gcd(&n)? != one::<B>()? {
         return Err(Error::InvalidProof(
             "curve is singular modulo a divisor of n",
         ));
