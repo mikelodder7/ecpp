@@ -65,6 +65,16 @@ pub trait ArithmeticBackend:
         !self.bit(0)
     }
 
+    /// Reports whether this value is zero.
+    fn is_zero(&self) -> bool {
+        self.bit_length() == 0
+    }
+
+    /// Reports whether this value is one.
+    fn is_one(&self) -> bool {
+        self.bit_length() == 1
+    }
+
     /// Computes `self ^ exponent mod modulus`.
     fn modular_pow(&self, exponent: &Self, modulus: &Self) -> Result<Self> {
         generic_modular_pow(self, exponent, modulus)
@@ -74,7 +84,7 @@ pub trait ArithmeticBackend:
     fn gcd(&self, other: &Self) -> Result<Self> {
         let mut left = self.clone();
         let mut right = other.clone();
-        while right.bit_length() != 0 {
+        while !right.is_zero() {
             let remainder = (left % &right)?;
             left = right;
             right = remainder;
@@ -93,7 +103,7 @@ pub trait ArithmeticBackend:
         let mut next_coefficient = one.clone();
         let mut remainder = modulus.clone();
         let mut next_remainder = (self.clone() % modulus)?;
-        while next_remainder != zero {
+        while !next_remainder.is_zero() {
             let quotient = (remainder.clone() / &next_remainder)?;
             let product = ((quotient.clone() * &next_coefficient)? % modulus)?;
             let old_coefficient = coefficient;
@@ -102,7 +112,7 @@ pub trait ArithmeticBackend:
                 ((old_coefficient - &product)? % modulus)?
             } else {
                 let difference = ((product - &old_coefficient)? % modulus)?;
-                if difference == zero {
+                if difference.is_zero() {
                     zero.clone()
                 } else {
                     (modulus.clone() - &difference)?
@@ -112,7 +122,7 @@ pub trait ArithmeticBackend:
             remainder = next_remainder;
             next_remainder = following_remainder;
         }
-        if remainder != one {
+        if !remainder.is_one() {
             return Err(Error::Composite);
         }
         Ok(coefficient)
@@ -122,14 +132,13 @@ pub trait ArithmeticBackend:
     ///
     /// Returns zero when `modulus` is zero or even.
     fn jacobi(&self, modulus: &Self) -> Result<i8> {
-        if modulus.bit_length() == 0 || modulus.is_even() {
+        if modulus.is_zero() || modulus.is_even() {
             return Ok(0);
         }
-        let one = Self::from_be_bytes(&[1])?;
         let mut value = (self.clone() % modulus)?;
         let mut modulus = modulus.clone();
         let mut result = 1i8;
-        while value.bit_length() != 0 {
+        while !value.is_zero() {
             while value.is_even() {
                 value = (value >> 1)?;
                 // For odd values, residue 3 or 5 modulo 8 is exactly when bits
@@ -146,7 +155,7 @@ pub trait ArithmeticBackend:
             }
             value = (value % &modulus)?;
         }
-        Ok(if modulus == one { result } else { 0 })
+        Ok(if modulus.is_one() { result } else { 0 })
     }
 }
 
@@ -1064,6 +1073,11 @@ mod tests {
         assert!(!seven.is_even());
         assert!(eight.is_even());
         assert!(zero.is_even());
+        assert!(zero.is_zero());
+        assert!(!one.is_zero());
+        assert!(one.is_one());
+        assert!(!two.is_one());
+        assert!(!zero.is_one());
 
         assert_eq!(seven.modular_pow(&three, &five).unwrap().to_be_bytes(), [3]);
         assert_eq!(seven.modular_pow(&zero, &five).unwrap().to_be_bytes(), [1]);

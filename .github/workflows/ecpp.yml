@@ -94,8 +94,8 @@ jobs:
           toolchain: nightly
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall --no-confirm cargo-careful
-      - run: cargo careful test --no-default-features --features=alloc,num-bigint
-      - run: cargo careful test --no-default-features --features=crypto-bigint
+      - run: cargo +nightly careful test --no-default-features --features=alloc,num-bigint
+      - run: cargo +nightly careful test --no-default-features --features=crypto-bigint
 
   clippy:
     runs-on: ubuntu-latest
@@ -136,7 +136,7 @@ jobs:
           toolchain: nightly
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall --no-confirm cargo-udeps
-      - run: cargo udeps --all-targets --all-features
+      - run: cargo +nightly udeps --all-targets --all-features
 
   outdated:
     runs-on: ubuntu-latest
