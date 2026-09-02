@@ -7,7 +7,7 @@
 ![MSRV][msrv-image]
 ![no_std][no-std-image]
 
-Backend-neutral Atkin–Morain elliptic curve primality proving for Rust.
+Backend-neutral Atkin–Morain Elliptic Curve Primality Proving.
 
 Unlike a probable-prime test, `ecpp` returns a primality certificate. The
 certificate can be stored, transferred, and verified deterministically without
@@ -26,14 +26,9 @@ make an unaudited implementation immune to software defects.
 
 ## Installation
 
-```toml
-[dependencies]
-ecpp = "0.1"
-```
-
-The default features enable `std`, operating-system randomness, and
-`crypto-bigint` integration. See [Feature flags](#feature-flags) for other
-configurations.
+The default features enable allocation, `std`, operating-system randomness,
+and the `num-bigint` and `crypto-bigint` backends. See
+[Feature flags](#feature-flags) for other configurations.
 
 ## Examples
 
@@ -71,10 +66,10 @@ assert!(!prime::check(&BigUint::from(561u32)));
 `prime::new` returns both artifacts so the proof is not discarded:
 
 ```rust,no_run
-use ecpp::{ProvedPrime, prime};
+use ecpp::{PrimalityProof, ProvedPrime, prime};
 use num_bigint::BigUint;
 
-let proved: ProvedPrime<BigUint> = prime::new(256)?;
+let proved: ProvedPrime<BigUint, PrimalityProof> = prime::new(256)?;
 proved.proof.verify_for(&proved.prime)?;
 
 let (prime, proof) = proved.into_parts();
@@ -87,20 +82,23 @@ println!("certificate steps: {}", proof.nodes.len());
 Use `prime::from_rng` and `prime::prove_with_rng` when the application supplies
 its own `rand_core::CryptoRng`.
 
-### Use `crypto-bigint`
+### Use `crypto-bigint` without allocation
 
-The `crypto-bigint` feature is enabled by default and supports both fixed-width
-and boxed unsigned integers:
+The `crypto-bigint` feature is enabled by default. Its `fixed` module performs
+the complete proof with `Uint<LIMBS>` and a caller-selected stack capacity:
 
 ```rust
 use crypto_bigint::U256;
-use ecpp::prime;
+use ecpp::fixed::{PrimalityProof, prove_with_rng};
+use rand::{SeedableRng, rngs::StdRng};
 
 let candidate = U256::from_u128(65_537);
-let proof = prime::prove(&candidate)?;
+let mut rng = StdRng::seed_from_u64(7);
+let proof: PrimalityProof<{ U256::BYTES }, 64> =
+    prove_with_rng(&candidate, &mut rng)?;
 proof.verify_for(&candidate)?;
 
-# Ok::<(), ecpp::Error>(())
+# Ok::<(), ecpp::fixed::Error>(())
 ```
 
 ### Use `rug` or OpenSSL
@@ -109,39 +107,42 @@ Enable the corresponding optional feature:
 
 ```toml
 [dependencies]
-ecpp = { version = "0.1", features = ["rug"] }
-# or: features = ["openssl"]
+ecpp = { version = "*", default-features = false, features = ["getrandom", "rug"] }
+# or: features = ["getrandom", "openssl"]
 ```
 
 The native `rug::Integer` and `openssl::bn::BigNum` types then implement
-`ecpp::Integer` and work with the same API.
+`ecpp::Integer` and work with the same API. Each feature supplies its own
+arithmetic engine; neither enables `num-bigint`.
 
-### Use `unknown_order::BigNumber`
-
-`unknown_order` can select mutually exclusive arithmetic backends. The
-canonical-byte API avoids coupling `ecpp` to any particular selection:
-
-```rust,ignore
+```rust
 use ecpp::prime;
-use unknown_order::BigNumber;
+use rug::Integer;
 
-let candidate = BigNumber::from(65_537u64);
-let bytes = candidate.to_bytes();
-
-let proof = prime::prove_be_bytes(&bytes)?;
-prime::verify_be_bytes(&bytes, &proof)?;
+let candidate = Integer::from(65_537);
+let proof = prime::prove(&candidate)?;
+proof.verify_for(&candidate)?;
 
 # Ok::<(), ecpp::Error>(())
 ```
 
-This path works with the `crypto`, `rust`, `gmp`, and `openssl`
-`unknown_order` backends.
+When several engines are enabled together, `prime::prove_with_backend` and
+`PrimalityProof::verify_with` let the caller choose explicitly. This also makes
+cross-backend verification visible at the call site:
+
+```rust,ignore
+let proof = prime::prove_with_backend::<ecpp::arithmetic::Rug, _, _>(
+    &candidate,
+    &mut rng,
+    ecpp::ProverOptions::default(),
+)?;
+proof.verify_with::<ecpp::arithmetic::OpenSsl>()?;
+```
 
 ### Serialize a certificate
 
-Enable `serde` to derive `Serialize` and `Deserialize` for all certificate
-types. The test suite covers Postcard, CBOR via `serde_cbor_2`, JSON, TOML, and
-YAML via `yaml_serde`:
+Enable `serde` to implement `Serialize` and `Deserialize` for all certificate
+types. The test suite covers `postcard`, CBOR, JSON, TOML, and YAML:
 
 ```rust,ignore
 use ecpp::prime;
@@ -157,41 +158,101 @@ decoded.verify_for(&candidate)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Certificates store integers as canonical unsigned big-endian magnitudes. A
-proof produced from one backend can therefore be verified against another.
+Certificates store integers as canonical unsigned big-endian magnitudes.
+Human-readable formats serialize those magnitudes as lowercase hexadecimal
+strings, while binary formats use byte strings. A proof produced from one
+backend can therefore be verified against another.
 
 ## Supported backends
 
 | Backend | Cargo feature | Integration |
 | --- | --- | --- |
-| `num_bigint::BigUint` / `BigInt` | Always available | Direct |
-| `crypto_bigint::Uint<LIMBS>` / `BoxedUint` | `crypto-bigint` (default) | Direct |
+| `num_bigint::BigUint` / `BigInt` | `num-bigint` (default) | Direct |
+| `crypto_bigint::Uint<LIMBS>` | `crypto-bigint` (default) | Allocation-free fixed proof; generic `CryptoUint<LIMBS>` with `alloc` |
+| `crypto_bigint::BoxedUint` | `crypto-bigint`, `alloc` | Generic `CryptoBigint` engine |
 | `rug::Integer` | `rug` | Direct |
 | `openssl::bn::BigNum` | `openssl` | Direct |
-| `unknown_order::BigNumber` | None required | `prove_be_bytes` / `verify_be_bytes` |
-| Other bigint libraries | None required | Implement the local `ecpp::Integer` trait |
+| `unknown_order::BigNumber` | Any heap engine | `prove_be_bytes` / `verify_be_bytes` |
+| Other bigint libraries | Any heap engine | Implement `ecpp::Integer`, or use canonical bytes |
 
-The backend trait only requires conversion to and from a canonical big-endian
-magnitude. ECPP handles public values, so this conversion is deliberately
-variable-time.
+`Integer` only converts caller values to and from a canonical big-endian
+magnitude. `ArithmeticBackend` drives the generic ECPP engine. The default
+engine is `num-bigint` when enabled, followed by boxed `crypto-bigint`, `rug`,
+and OpenSSL. The `*_with_backend` APIs select one explicitly. ECPP handles
+public values, so these operations are deliberately variable-time.
 
 ## Feature flags
 
 | Feature | Default | Description |
 | --- | --- | --- |
-| `std` | Yes | Enables standard-library support for the arithmetic dependencies |
+| `alloc` | Yes | Enables neutral heap proof types and generic APIs without selecting an engine |
+| `std` | Yes | Extends enabled backends with standard-library support |
+| `num-bigint` | Yes | Enables the `num-bigint` arithmetic engine |
 | `getrandom` | Yes | Enables `prime::new`, `prime::prove`, and other OS-RNG convenience functions |
-| `crypto-bigint` | Yes | Implements `ecpp::Integer` for `crypto-bigint` unsigned integers |
+| `crypto-bigint` | Yes | Enables allocation-free fixed proving and, with `alloc`, boxed and fixed-width generic engines |
 | `rug` | No | Implements `ecpp::Integer` for `rug::Integer` |
 | `openssl` | No | Implements `ecpp::Integer` for OpenSSL `BigNum` |
 | `serde` | No | Enables certificate serialization and deserialization |
 
-Without `getrandom`, use the `_with_rng` APIs. A minimal allocation-enabled
-`no_std` build is available with:
+Without `getrandom`, use the `_with_rng` APIs. A `num-bigint`-backed `no_std`
+build is available with:
 
 ```console
-cargo build --no-default-features
+cargo build --no-default-features --features num-bigint
 ```
+
+Fixed-width `crypto-bigint` proving needs no allocator and does not activate
+`num-bigint`:
+
+```console
+cargo build --no-default-features --features crypto-bigint
+```
+
+```rust
+use crypto_bigint::U256;
+use ecpp::fixed::{PrimalityProof, from_rng, prove_with_rng};
+use ecpp::ProvedPrime;
+use rand::{SeedableRng, rngs::StdRng};
+
+let candidate = U256::from(65_537u32);
+let mut rng = StdRng::seed_from_u64(7);
+let proof: PrimalityProof<{ U256::BYTES }, 64> =
+    prove_with_rng(&candidate, &mut rng)?;
+proof.verify_for(&candidate)?;
+
+let generated: ProvedPrime<U256, PrimalityProof<{ U256::BYTES }, 64>> =
+    from_rng(128, &mut rng)?;
+generated.proof.verify_for(&generated.prime)?;
+
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+When `alloc` is also enabled, `proof.to_alloc()` converts a fixed certificate
+to the neutral heap format. That certificate can then be verified using any
+generic engine. `arithmetic::CryptoBigint` is backed by `BoxedUint` and grows
+as needed. `arithmetic::CryptoUint<LIMBS>` uses `Uint<LIMBS>` as an explicitly
+bounded working representation:
+
+```rust
+use crypto_bigint::{U256, U512};
+use ecpp::{ProverOptions, arithmetic::CryptoUint, prime};
+use rand::{SeedableRng, rngs::StdRng};
+
+let candidate = U256::from(65_537u32);
+let mut rng = StdRng::seed_from_u64(7);
+let proof = prime::prove_with_backend::<CryptoUint<{ U512::LIMBS }>, _, _>(
+    &candidate,
+    &mut rng,
+    ProverOptions::default(),
+)?;
+proof.verify_for_with::<CryptoUint<{ U512::LIMBS }>, _>(&candidate)?;
+
+# Ok::<(), ecpp::Error>(())
+```
+
+The working width should normally be at least twice the candidate width so
+unreduced products fit. Insufficient capacity returns `Error::Arithmetic`
+instead of wrapping.
 
 ## How the proof works
 
@@ -215,17 +276,18 @@ Each [`EcppStep`](https://docs.rs/ecpp/latest/ecpp/struct.EcppStep.html) records
 - the candidate `n`;
 - the short Weierstrass curve `y² = x³ + ax + b (mod n)`;
 - an affine point on that curve;
-- a known annihilating order `m`; and
-- the recursively certified prime divisor `q` of `m`.
+- the cofactor `m/q`; and
+- the recursively certified prime divisor `q`.
 
 The verifier does not trust the CM construction or the producer's
 factorization work. It independently checks:
 
 - that the curve is nonsingular modulo every divisor of `n`;
 - that the certificate point lies on the curve;
-- that `q` divides `m` and exceeds the elliptic Pocklington bound
+- that `q` exceeds the elliptic Pocklington bound
   `(n^(1/4) + 1)²`;
-- that multiplying by `m / q` does not annihilate the point; and
+- that multiplying by the recorded cofactor `m/q` does not annihilate the
+  point; and
 - that the following multiplication by `q` does annihilate it.
 
 All affine divisions must be invertible modulo `n`; a nontrivial gcd causes
@@ -248,10 +310,10 @@ Prime generation handles it by trying another candidate.
 screening or arithmetic. `Error::InvalidProof` means a supplied certificate
 failed deterministic verification.
 
-`ProverOptions` exposes the trial-division limit, point-attempt limit, and
+`ProverOptions` exposes the trial-division limit, point-search limit, and
 maximum certificate depth.
 
-## Minimum Supported Rust Version
+## Minimum supported Rust version
 
 This crate requires **Rust 1.98** at a minimum.
 
@@ -264,7 +326,7 @@ The test suite covers:
 - recursive construction and verification of a 128-bit certificate;
 - deterministic 64-bit base cases and known pseudoprimes;
 - rejection of composite inputs and tampered certificates;
-- certificate serialization through Postcard, CBOR, JSON, TOML, and YAML;
+- certificate serialization through `postcard`, CBOR, JSON, TOML, and YAML;
 - direct `num-bigint`, `crypto-bigint`, `rug`, and OpenSSL interoperability;
 - canonical-byte interoperability for wrapper backends; and
 - an ignored, expensive regression proving the secp256k1 field modulus.
@@ -325,8 +387,8 @@ resources:
 
 Licensed under either of:
 
-- [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0)
-- [MIT license](http://opensource.org/licenses/MIT)
+- [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- [MIT license](https://opensource.org/licenses/MIT)
 
 at your option.
 
@@ -334,7 +396,7 @@ at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in this work by you, as defined in the Apache-2.0
-license, shall be dual licensed as above, without any additional terms or
+license, shall be dual-licensed as above, without any additional terms or
 conditions.
 
 [//]: # (badges)

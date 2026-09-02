@@ -12,24 +12,25 @@ categories = ["cryptography", "algorithms", "mathematics"]
 readme = "README.md"
 
 [features]
-default = ["std", "getrandom", "crypto-bigint"]
-std = ["num-bigint/std", "num-integer/std", "num-traits/std"]
+default = ["std", "getrandom", "num-bigint", "crypto-bigint"]
+alloc = ["crypto-bigint?/alloc"]
+std = ["alloc", "num-bigint?/std"]
 getrandom = ["dep:getrandom"]
-crypto-bigint = ["dep:crypto-bigint"]
-openssl = ["dep:openssl"]
-rug = ["dep:rug"]
-serde = ["dep:serde"]
+num-bigint = ["alloc", "dep:num-bigint"]
+crypto-bigint = ["dep:crypto-bigint", "crypto-bigint/rand_core"]
+openssl = ["std", "dep:openssl"]
+rug = ["alloc", "dep:rug"]
+serde = ["alloc", "dep:serde", "dep:serdect"]
 
 [dependencies]
-crypto-bigint = { version = "0.7.5", default-features = false, features = ["alloc"], optional = true }
+crypto-bigint = { version = "0.7.5", default-features = false, optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
-num-bigint = { version = "0.5", default-features = false }
-num-integer = { version = "0.1", default-features = false }
-num-traits = { version = "0.2", default-features = false }
+num-bigint = { version = "0.5", default-features = false, optional = true }
 openssl = { version = "0.10.75", optional = true }
 rand_core = "0.10"
 rug = { version = "1.28", default-features = false, features = ["integer"], optional = true }
 serde = { version = "1", default-features = false, features = ["alloc", "derive"], optional = true }
+serdect = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
 thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
@@ -42,5 +43,5 @@ yaml_serde = "0.10"
 
 [package.metadata.docs.rs]
 all-features = false
-features = ["std", "getrandom", "crypto-bigint", "openssl", "rug", "serde"]
+features = ["std", "getrandom", "num-bigint", "crypto-bigint", "openssl", "rug", "serde"]
 rustdoc-args = ["--cfg", "docsrs"]

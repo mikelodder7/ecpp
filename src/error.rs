@@ -3,13 +3,16 @@ use crate::Natural;
 /// Errors produced while constructing or checking a primality proof.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum Error {
-    /// The input is negative, even, too small, or does not fit the requested backend.
+    /// The input is negative, even, or too small, or it does not fit the requested backend.
     #[error("invalid input: {0}")]
     InvalidInput(&'static str),
     /// A compositeness witness was found.
     #[error("candidate is composite")]
     Composite,
-    /// The configured CM/factor search did not find a proof step.
+    /// The selected arithmetic backend could not complete an operation.
+    #[error("arithmetic backend failed: {0}")]
+    Arithmetic(&'static str),
+    /// The configured CM or factor search did not find a proof step.
     #[error("ECPP search exhausted while proving {candidate}")]
     SearchExhausted {
         /// Candidate at which construction stopped.

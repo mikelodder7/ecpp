@@ -1,12 +1,7 @@
-use alloc::vec::Vec;
-
-use num_bigint::BigUint;
-use num_traits::{One, Zero};
-
-use crate::math::{integer_sqrt, is_square, mod_signed, mod_sub, modular_sqrt};
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ClassPolynomial {
+    // The embedded Hilbert class polynomials have degree at most two, so their
+    // roots can be recovered directly instead of by general polynomial logic.
     Linear(i128),
     Quadratic { constant: i128, linear: i128 },
 }
@@ -18,7 +13,7 @@ pub(crate) struct Discriminant {
 }
 
 /// Fundamental class-number-one and class-number-two discriminants excluding
-/// the special j=0 and j=1728 cases.
+/// the special `j = 0` and `j = 1728` cases.
 pub(crate) const DISCRIMINANTS: [Discriminant; 25] = [
     Discriminant {
         value: -7,
@@ -175,69 +170,3 @@ pub(crate) const DISCRIMINANTS: [Discriminant; 25] = [
         },
     },
 ];
-
-pub(crate) fn j_invariants(
-    candidate: &BigUint,
-    polynomial: ClassPolynomial,
-) -> Option<Vec<BigUint>> {
-    match polynomial {
-        ClassPolynomial::Linear(root) => Some(alloc::vec![mod_signed(root, candidate)]),
-        ClassPolynomial::Quadratic { constant, linear } => {
-            let linear_mod = mod_signed(linear, candidate);
-            let constant_mod = mod_signed(constant, candidate);
-            let discriminant = mod_sub(
-                &(&linear_mod * &linear_mod % candidate),
-                &(&constant_mod * 4u8 % candidate),
-                candidate,
-            );
-            let square_root = modular_sqrt(&discriminant, candidate)?;
-            let inverse_two = (candidate + 1u8) >> 1usize;
-            let minus_linear = if linear_mod.is_zero() {
-                BigUint::zero()
-            } else {
-                candidate - linear_mod
-            };
-            let first =
-                (mod_sub(&minus_linear, &square_root, candidate) * &inverse_two) % candidate;
-            let second = ((minus_linear + square_root) * inverse_two) % candidate;
-            Some(alloc::vec![first, second])
-        }
-    }
-}
-
-/// Cohen's modified Cornacchia algorithm for `4n = u² + |D|v²`.
-pub(crate) fn cornacchia(candidate: &BigUint, discriminant: i16) -> Option<(BigUint, BigUint)> {
-    let absolute = discriminant.unsigned_abs();
-    let residue = mod_signed(discriminant as i128, candidate);
-    let mut root = modular_sqrt(&residue, candidate)?;
-    let expected_odd = absolute & 1 == 1;
-    let root_odd = (&root & BigUint::one()) == BigUint::one();
-    if root_odd != expected_odd {
-        root = candidate - root;
-    }
-
-    let mut previous = candidate << 1usize;
-    let mut current = root;
-    let limit = integer_sqrt(&(candidate << 2usize));
-    while current > limit {
-        let remainder = &previous % &current;
-        previous = current;
-        current = remainder;
-        if current.is_zero() {
-            return None;
-        }
-    }
-
-    let four_n = candidate << 2usize;
-    let square = &current * &current;
-    if square > four_n {
-        return None;
-    }
-    let remainder = four_n - square;
-    if &remainder % absolute != BigUint::zero() {
-        return None;
-    }
-    let v_squared = remainder / absolute;
-    let v = is_square(&v_squared)?;
-    Some((current, v))
-}

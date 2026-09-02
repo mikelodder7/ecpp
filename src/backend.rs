@@ -4,14 +4,16 @@ use core::fmt;
 #[cfg(any(feature = "crypto-bigint", feature = "rug"))]
 use alloc::vec;
 
+#[cfg(feature = "num-bigint")]
 use num_bigint::{BigInt, BigUint, Sign};
 
 /// Conversion boundary between ECPP and an integer backend.
 ///
-/// Primality is public-data computation, so canonical variable-time encoding is
-/// intentional. Implementing this trait is sufficient to use another backend.
+/// Primality testing operates on public data, so canonical variable-time
+/// encoding is intentional. Implementing this trait is sufficient to use
+/// another backend.
 pub trait Integer: Sized {
-    /// Returns the unsigned, big-endian magnitude with no redundant leading zero.
+    /// Returns the unsigned, big-endian magnitude with no redundant leading zeros.
     fn to_be_bytes(&self) -> Vec<u8>;
 
     /// Constructs an integer from an unsigned, big-endian magnitude.
@@ -27,7 +29,6 @@ pub trait Integer: Sized {
 
 /// A canonical, backend-neutral non-negative integer used in certificates.
 #[derive(Clone, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Natural(Vec<u8>);
 
 impl Natural {
@@ -49,14 +50,6 @@ impl Natural {
     pub fn to_integer<T: Integer>(&self) -> Option<T> {
         T::from_be_bytes(&self.0)
     }
-
-    pub(crate) fn from_biguint(value: &BigUint) -> Self {
-        Self::from_be_bytes(&value.to_bytes_be())
-    }
-
-    pub(crate) fn to_biguint(&self) -> BigUint {
-        BigUint::from_bytes_be(&self.0)
-    }
 }
 
 impl fmt::Debug for Natural {
@@ -74,10 +67,55 @@ impl fmt::Debug for Natural {
 
 impl fmt::Display for Natural {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.to_biguint())
+        if self.0.is_empty() {
+            return formatter.write_str("0");
+        }
+        let mut quotient = self.0.clone();
+        let mut digits = Vec::with_capacity(quotient.len() * 8);
+        let mut first = 0;
+        while first < quotient.len() {
+            let mut remainder = 0u16;
+            for byte in &mut quotient[first..] {
+                let value = remainder * 256 + u16::from(*byte);
+                *byte = (value / 10) as u8;
+                remainder = value % 10;
+            }
+            digits.push(b'0' + remainder as u8);
+            while first < quotient.len() && quotient[first] == 0 {
+                first += 1;
+            }
+        }
+        for digit in digits.iter().rev() {
+            formatter.write_str(
+                core::str::from_utf8(core::slice::from_ref(digit)).map_err(|_| fmt::Error)?,
+            )?;
+        }
+        Ok(())
     }
 }
 
+#[cfg(feature = "serde")]
+impl serde::Serialize for Natural {
+    fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serdect::slice::serialize_hex_lower_or_bin(&self.0, serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Natural {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = serdect::slice::deserialize_hex_or_bin_vec(deserializer)?;
+        Ok(Self::from_be_bytes(&bytes))
+    }
+}
+
+#[cfg(feature = "num-bigint")]
 impl Integer for BigUint {
     fn to_be_bytes(&self) -> Vec<u8> {
         self.to_bytes_be()
@@ -88,6 +126,7 @@ impl Integer for BigUint {
     }
 }
 
+#[cfg(feature = "num-bigint")]
 impl Integer for BigInt {
     fn to_be_bytes(&self) -> Vec<u8> {
         self.magnitude().to_bytes_be()
@@ -158,7 +197,7 @@ impl<const LIMBS: usize> Integer for crypto_bigint::Uint<LIMBS> {
     }
 }
 
-#[cfg(feature = "crypto-bigint")]
+#[cfg(all(feature = "crypto-bigint", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "crypto-bigint")))]
 impl Integer for crypto_bigint::BoxedUint {
     fn to_be_bytes(&self) -> Vec<u8> {
@@ -225,6 +264,27 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serde")]
+    fn serde_uses_hex_for_human_readable_formats_and_bytes_for_binary_formats() {
+        let natural = Natural::from_be_bytes(&[0, 1, 0, 1]);
+
+        let json = serde_json::to_string(&natural).unwrap();
+        assert_eq!(json, "\"010001\"");
+        assert_eq!(serde_json::from_str::<Natural>(&json).unwrap(), natural);
+
+        let cbor = serde_cbor_2::to_vec(&natural).unwrap();
+        assert_eq!(cbor, [0x43, 1, 0, 1]);
+        assert_eq!(serde_cbor_2::from_slice::<Natural>(&cbor).unwrap(), natural);
+
+        let postcard = postcard::to_allocvec(&natural).unwrap();
+        assert_eq!(postcard::from_bytes::<Natural>(&postcard).unwrap(), natural);
+
+        let canonical: Natural = serde_json::from_str("\"00010001\"").unwrap();
+        assert_eq!(canonical, natural);
+    }
+
+    #[test]
+    #[cfg(feature = "num-bigint")]
     fn signed_backend_reports_negative_values() {
         let negative = BigInt::from(-1);
         assert!(Integer::is_negative(&negative));

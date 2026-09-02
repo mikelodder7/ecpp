@@ -32,8 +32,8 @@ pub struct EcppStep {
     pub curve: Curve,
     /// Point used by the elliptic Pocklington criterion.
     pub point: Point,
-    /// Known curve order `m`.
-    pub order: Natural,
+    /// Multiplier `m/q` used to obtain a point whose order is divisible by `q`.
+    pub cofactor: Natural,
     /// Prime divisor `q` of `m`, certified by the following proof node.
     pub q: Natural,
 }
@@ -65,13 +65,16 @@ impl PrimalityProof {
         }
     }
 
-    /// Checks this proof without needing the original backend value.
-    pub fn verify(&self) -> Result<()> {
-        crate::prime::verify_proof(self)
+    /// Checks this proof using the arithmetic backend `B`.
+    pub fn verify_with<B: crate::arithmetic::ArithmeticBackend>(&self) -> Result<()> {
+        crate::engine::verify_proof::<B>(self)
     }
 
-    /// Checks that this proof certifies `candidate`.
-    pub fn verify_for<T: Integer>(&self, candidate: &T) -> Result<()> {
+    /// Checks that this proof certifies `candidate` using the arithmetic backend `B`.
+    pub fn verify_for_with<B: crate::arithmetic::ArithmeticBackend, T: Integer>(
+        &self,
+        candidate: &T,
+    ) -> Result<()> {
         if candidate.is_negative() {
             return Err(Error::InvalidInput("candidate must be non-negative"));
         }
@@ -79,7 +82,61 @@ impl PrimalityProof {
         if self.number().as_ref() != Some(&expected) {
             return Err(Error::InvalidProof("proof is for a different integer"));
         }
-        self.verify()
+        self.verify_with::<B>()
+    }
+
+    /// Checks this proof with the default enabled heap-backed arithmetic backend.
+    #[cfg(any(
+        feature = "num-bigint",
+        feature = "crypto-bigint",
+        feature = "rug",
+        feature = "openssl"
+    ))]
+    pub fn verify(&self) -> Result<()> {
+        #[cfg(feature = "num-bigint")]
+        return self.verify_with::<crate::arithmetic::NumBigint>();
+        #[cfg(all(not(feature = "num-bigint"), feature = "crypto-bigint"))]
+        return self.verify_with::<crate::arithmetic::CryptoBigint>();
+        #[cfg(all(
+            not(feature = "num-bigint"),
+            not(feature = "crypto-bigint"),
+            feature = "rug"
+        ))]
+        return self.verify_with::<crate::arithmetic::Rug>();
+        #[cfg(all(
+            not(feature = "num-bigint"),
+            not(feature = "crypto-bigint"),
+            not(feature = "rug"),
+            feature = "openssl"
+        ))]
+        self.verify_with::<crate::arithmetic::OpenSsl>()
+    }
+
+    /// Checks that this proof certifies `candidate` with the default backend.
+    #[cfg(any(
+        feature = "num-bigint",
+        feature = "crypto-bigint",
+        feature = "rug",
+        feature = "openssl"
+    ))]
+    pub fn verify_for<T: Integer>(&self, candidate: &T) -> Result<()> {
+        #[cfg(feature = "num-bigint")]
+        return self.verify_for_with::<crate::arithmetic::NumBigint, T>(candidate);
+        #[cfg(all(not(feature = "num-bigint"), feature = "crypto-bigint"))]
+        return self.verify_for_with::<crate::arithmetic::CryptoBigint, T>(candidate);
+        #[cfg(all(
+            not(feature = "num-bigint"),
+            not(feature = "crypto-bigint"),
+            feature = "rug"
+        ))]
+        return self.verify_for_with::<crate::arithmetic::Rug, T>(candidate);
+        #[cfg(all(
+            not(feature = "num-bigint"),
+            not(feature = "crypto-bigint"),
+            not(feature = "rug"),
+            feature = "openssl"
+        ))]
+        self.verify_for_with::<crate::arithmetic::OpenSsl, T>(candidate)
     }
 }
 
@@ -99,7 +156,7 @@ mod tests {
         let encoded = postcard::to_allocvec(&proof).unwrap();
         let decoded: PrimalityProof = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, proof);
-        decoded.verify().unwrap();
+        verify_when_backend_is_available(&decoded);
     }
 
     #[test]
@@ -108,7 +165,7 @@ mod tests {
         let encoded = serde_cbor_2::to_vec(&proof).unwrap();
         let decoded: PrimalityProof = serde_cbor_2::from_slice(&encoded).unwrap();
         assert_eq!(decoded, proof);
-        decoded.verify().unwrap();
+        verify_when_backend_is_available(&decoded);
     }
 
     #[test]
@@ -117,7 +174,7 @@ mod tests {
         let encoded = serde_json::to_vec(&proof).unwrap();
         let decoded: PrimalityProof = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, proof);
-        decoded.verify().unwrap();
+        verify_when_backend_is_available(&decoded);
     }
 
     #[test]
@@ -126,7 +183,7 @@ mod tests {
         let encoded = toml::to_string(&proof).unwrap();
         let decoded: PrimalityProof = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, proof);
-        decoded.verify().unwrap();
+        verify_when_backend_is_available(&decoded);
     }
 
     #[test]
@@ -135,6 +192,23 @@ mod tests {
         let encoded = yaml_serde::to_string(&proof).unwrap();
         let decoded: PrimalityProof = yaml_serde::from_str(&encoded).unwrap();
         assert_eq!(decoded, proof);
-        decoded.verify().unwrap();
+        verify_when_backend_is_available(&decoded);
+    }
+
+    fn verify_when_backend_is_available(proof: &PrimalityProof) {
+        #[cfg(any(
+            feature = "num-bigint",
+            feature = "crypto-bigint",
+            feature = "rug",
+            feature = "openssl"
+        ))]
+        proof.verify().unwrap();
+        #[cfg(not(any(
+            feature = "num-bigint",
+            feature = "crypto-bigint",
+            feature = "rug",
+            feature = "openssl"
+        )))]
+        let _ = proof;
     }
 }
