@@ -1,0 +1,3 @@
+[default.extend-words]
+# Agrawal–Kayal–Saxena primality test, cited in the README references.
+AKS = "AKS"

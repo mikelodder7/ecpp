@@ -262,7 +262,7 @@ The prover constructs an Atkin–Morain ECPP chain. At each level it:
 2. Chooses a CM discriminant and solves `4n = u² + |D|v²` with Cohen's
    modified Cornacchia algorithm.
 3. Derives candidate curve orders `n + 1 ± u`.
-4. Uses trial division and bounded Pollard–rho to find a sufficiently large
+4. Uses trial division and bounded Pollard rho to find a sufficiently large
    probable-prime divisor `q` of a candidate order.
 5. Constructs a CM elliptic curve and finds a certificate point.
 6. Reduces the proof of `n` to a proof of the smaller `q`.
@@ -297,7 +297,7 @@ verification to fail.
 
 ECPP certificate construction is a search algorithm. This implementation uses
 a bounded discriminant set, bounded factor search, and bounded point search.
-Consequently, a prime may return:
+Consequently, proving a prime may return:
 
 ```text
 Error::SearchExhausted { candidate }
