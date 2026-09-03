@@ -686,7 +686,7 @@ fn quadratic_twist<const LIMBS: usize>(
     let odd = Odd::new(*candidate).into_option().ok_or(Error::Composite)?;
     let modulus = odd.as_nz_ref();
     let mut non_residue = Uint::from(2u8);
-    while i8::from(non_residue.jacobi_symbol_vartime(&odd)) != -1 {
+    while jacobi(&non_residue, &odd) != -1 {
         non_residue = non_residue
             .checked_add(&Uint::ONE)
             .into_option()
@@ -961,6 +961,41 @@ fn verify_step<const LIMBS: usize>(
     Ok(())
 }
 
+/// Computes the Jacobi symbol `(value / modulus)` with the classic binary
+/// algorithm.
+///
+/// `Uint::jacobi_symbol_vartime` in released crypto-bigint (through 0.7.5)
+/// returns an incorrect sign for some inputs of four or more limbs
+/// (RustCrypto/crypto-bigint#1295, fixed upstream but unreleased), so it
+/// must not be used here.
+fn jacobi<const LIMBS: usize>(value: &Uint<LIMBS>, modulus: &Odd<Uint<LIMBS>>) -> i8 {
+    let mut value = value.rem_vartime(modulus.as_nz_ref());
+    let mut modulus = *modulus.as_ref();
+    let mut result = 1i8;
+    while value != Uint::ZERO {
+        while !value.bit_vartime(0) {
+            value = value.shr_vartime(1);
+            // For odd values, residue 3 or 5 modulo 8 is exactly when bits
+            // one and two differ.
+            if modulus.bit_vartime(1) != modulus.bit_vartime(2) {
+                result = -result;
+            }
+        }
+        core::mem::swap(&mut value, &mut modulus);
+        // Both operands are odd here, so bit one alone decides whether each
+        // is 3 modulo 4.
+        if value.bit_vartime(1) && modulus.bit_vartime(1) {
+            result = -result;
+        }
+        // The divisor is odd at every iteration, so it is never zero.
+        let Some(modulus_nonzero) = nonzero(modulus) else {
+            return 0;
+        };
+        value = value.rem_vartime(&modulus_nonzero);
+    }
+    if modulus == Uint::ONE { result } else { 0 }
+}
+
 fn modular_sqrt<const LIMBS: usize>(
     value: &Uint<LIMBS>,
     modulus: &Uint<LIMBS>,
@@ -969,7 +1004,7 @@ fn modular_sqrt<const LIMBS: usize>(
         return Some(Uint::ZERO);
     }
     let odd = Odd::new(*modulus).into_option()?;
-    if i8::from(value.jacobi_symbol_vartime(&odd)) != 1 {
+    if jacobi(value, &odd) != 1 {
         return None;
     }
     let params = FixedMontyParams::new_vartime(odd);
@@ -985,7 +1020,7 @@ fn modular_sqrt<const LIMBS: usize>(
     let exponent = odd_part.trailing_zeros_vartime();
     odd_part = odd_part.shr_vartime(exponent);
     let mut non_residue = Uint::from(2u8);
-    while i8::from(non_residue.jacobi_symbol_vartime(&odd)) != -1 {
+    while jacobi(&non_residue, &odd) != -1 {
         non_residue = non_residue.checked_add(&Uint::ONE).into_option()?;
         if non_residue >= *modulus {
             return None;
@@ -1230,6 +1265,33 @@ mod tests {
         let generated: crate::ProvedPrime<U256, PrimalityProof<{ U256::BYTES }, 8>> =
             from_rng(16, &mut rng).unwrap();
         generated.proof.verify_for(&generated.prime).unwrap();
+    }
+
+    #[test]
+    fn jacobi_is_correct_where_jacobi_symbol_vartime_is_not() {
+        use crypto_bigint::U512;
+
+        // crypto-bigint 0.7.5's `jacobi_symbol_vartime` returns -1 for this
+        // input; GMP, num-bigint, and the binary algorithm agree on +1.
+        let mut value_bytes = [0u8; 64];
+        value_bytes[54..]
+            .copy_from_slice(&[0x60, 0x93, 0x39, 0x2a, 0xf9, 0x34, 0x22, 0x72, 0xbc, 0x3f]);
+        let mut modulus_bytes = [0u8; 64];
+        modulus_bytes[23..].copy_from_slice(&[
+            0x28, 0x29, 0x56, 0x7a, 0x53, 0xf3, 0xea, 0x42, 0xc3, 0xe3, 0xd8, 0x35, 0x1a, 0x66,
+            0xa7, 0x29, 0x0c, 0xd7, 0x52, 0x15, 0xd8, 0x57, 0x95, 0xd1, 0xc3, 0x02, 0x38, 0x20,
+            0x9f, 0xbb, 0x15, 0x30, 0x42, 0xba, 0x4f, 0x2d, 0xf1, 0xc8, 0x8f, 0xf4, 0x47,
+        ]);
+        let value = U512::from_be_slice(&value_bytes);
+        let modulus = Odd::new(U512::from_be_slice(&modulus_bytes)).unwrap();
+        assert_eq!(jacobi(&value, &modulus), 1);
+
+        let seven = Odd::new(U512::from(7u8)).unwrap();
+        assert_eq!(jacobi(&U512::from(2u8), &seven), 1);
+        assert_eq!(jacobi(&U512::from(3u8), &seven), -1);
+        assert_eq!(jacobi(&U512::ZERO, &seven), 0);
+        let one = Odd::new(U512::ONE).unwrap();
+        assert_eq!(jacobi(&U512::from(5u8), &one), 1);
     }
 
     #[test]

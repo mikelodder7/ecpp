@@ -740,10 +740,10 @@ impl<const LIMBS: usize> ArithmeticBackend for CryptoUint<LIMBS> {
             .ok_or(Error::Composite)
     }
 
-    // No `jacobi` override: `Uint::jacobi_symbol_vartime` in crypto-bigint
-    // 0.7.5 returns an incorrect sign for some multi-limb inputs (verified
-    // against GMP and two independent implementations), so the generic
-    // default is used instead.
+    // No `jacobi` override: `Uint::jacobi_symbol_vartime` in released
+    // crypto-bigint (through 0.7.5) returns an incorrect sign for some
+    // inputs of four or more limbs (RustCrypto/crypto-bigint#1295, fixed
+    // upstream but unreleased), so the generic default is used instead.
     fn sqrt(&self) -> Result<Self> {
         Ok(Self(self.0.floor_sqrt_vartime()))
     }
