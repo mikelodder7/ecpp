@@ -50,23 +50,8 @@ fn modular_signed<B: ArithmeticBackend>(value: i128, modulus: &B) -> Result<B> {
     }
 }
 
-fn integer_sqrt<B: ArithmeticBackend>(value: &B) -> Result<B> {
-    if cmp_u64::<B>(value, 2)? == Ordering::Less {
-        return Ok(value.clone());
-    }
-    let shift = value.bit_length().div_ceil(2);
-    let mut estimate = (one::<B>()? << shift)?;
-    loop {
-        let next = (((value.clone() / &estimate)? + &estimate)? >> 1)?;
-        if next >= estimate {
-            return Ok(estimate);
-        }
-        estimate = next;
-    }
-}
-
 fn is_square<B: ArithmeticBackend>(value: &B) -> Result<Option<B>> {
-    let root = integer_sqrt::<B>(value)?;
+    let root = value.sqrt()?;
     Ok(((root.clone() * &root)? == *value).then_some(root))
 }
 
@@ -245,7 +230,7 @@ fn cornacchia<B: ArithmeticBackend>(candidate: &B, discriminant: i16) -> Result<
     let mut previous = (candidate.clone() << 1)?;
     let mut current = root;
     let four_candidate = (candidate.clone() << 2)?;
-    let limit = integer_sqrt::<B>(&four_candidate)?;
+    let limit = four_candidate.sqrt()?;
     while current > limit {
         let remainder = (previous % &current)?;
         previous = current;
@@ -271,7 +256,7 @@ fn cornacchia<B: ArithmeticBackend>(candidate: &B, discriminant: i16) -> Result<
 }
 
 fn ceil_fourth_root<B: ArithmeticBackend>(value: &B) -> Result<B> {
-    let mut root = integer_sqrt::<B>(&integer_sqrt::<B>(value)?)?;
+    let mut root = value.sqrt()?.sqrt()?;
     let square = (root.clone() * &root)?;
     if (square.clone() * &square)? < *value {
         root = add_u64::<B>(&root, 1)?;

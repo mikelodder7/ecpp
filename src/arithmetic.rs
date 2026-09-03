@@ -157,6 +157,22 @@ pub trait ArithmeticBackend:
         }
         Ok(if modulus.is_one() { result } else { 0 })
     }
+
+    /// Computes the integer square root, rounding down.
+    fn sqrt(&self) -> Result<Self> {
+        if self.bit_length() < 2 {
+            return Ok(self.clone());
+        }
+        let shift = self.bit_length().div_ceil(2);
+        let mut estimate = (Self::from_be_bytes(&[1])? << shift)?;
+        loop {
+            let next = (((self.clone() / &estimate)? + &estimate)? >> 1)?;
+            if next >= estimate {
+                return Ok(estimate);
+            }
+            estimate = next;
+        }
+    }
 }
 
 /// Square-and-multiply `base ^ exponent mod modulus` over the operator surface.
@@ -205,6 +221,10 @@ impl ArithmeticBackend for NumBigint {
 
     fn bit(&self, index: usize) -> bool {
         self.0.bit(index as u64)
+    }
+
+    fn sqrt(&self) -> Result<Self> {
+        Ok(Self(self.0.sqrt()))
     }
 
     fn modular_pow(&self, exponent: &Self, modulus: &Self) -> Result<Self> {
@@ -329,6 +349,10 @@ impl ArithmeticBackend for Rug {
 
     fn bit(&self, index: usize) -> bool {
         u32::try_from(index).is_ok_and(|index| self.0.get_bit(index))
+    }
+
+    fn sqrt(&self) -> Result<Self> {
+        Ok(Self(self.0.clone().sqrt()))
     }
 
     fn modular_pow(&self, exponent: &Self, modulus: &Self) -> Result<Self> {
@@ -494,6 +518,55 @@ impl ArithmeticBackend for CryptoBigint {
 
     fn bit(&self, index: usize) -> bool {
         u32::try_from(index).is_ok_and(|index| self.0.bit_vartime(index))
+    }
+
+    fn modular_pow(&self, exponent: &Self, modulus: &Self) -> Result<Self> {
+        let Some(odd) = crypto_bigint::Odd::new(modulus.0.clone()).into_option() else {
+            // The native path requires an odd modulus.
+            return generic_modular_pow(self, exponent, modulus);
+        };
+        // `pow_mod` requires operands with matching precision; reducing first
+        // yields the modulus's precision.
+        let reduced = self.0.rem_vartime(odd.as_nz_ref());
+        Ok(Self::normalize(reduced.pow_mod(&exponent.0, &odd)))
+    }
+
+    fn gcd(&self, other: &Self) -> Result<Self> {
+        use crypto_bigint::{Gcd, Resize};
+
+        if self.is_zero() {
+            return Ok(other.clone());
+        }
+        if other.is_zero() {
+            return Ok(self.clone());
+        }
+        let precision = self.0.bits_precision().max(other.0.bits_precision());
+        let left = (&self.0).resize(precision);
+        let right = (&other.0).resize(precision);
+        Ok(Self::normalize(left.gcd_vartime(&right)))
+    }
+
+    fn modular_inverse(&self, modulus: &Self) -> Result<Self> {
+        if modulus.is_one() {
+            // Every residue modulo one is zero, which is its own inverse there.
+            // `invert_mod` instead reports the degenerate ring as non-invertible.
+            return Ok(Self::default());
+        }
+        let Some(modulus) = crypto_bigint::NonZero::new(modulus.0.clone()).into_option() else {
+            return Err(Error::Arithmetic("remainder by zero"));
+        };
+        // `invert_mod` requires operands with matching limb counts; reducing
+        // first yields the modulus's precision.
+        let reduced = self.0.rem_vartime(&modulus);
+        reduced
+            .invert_mod(&modulus)
+            .into_option()
+            .map(Self::normalize)
+            .ok_or(Error::Composite)
+    }
+
+    fn sqrt(&self) -> Result<Self> {
+        Ok(Self::normalize(self.0.floor_sqrt_vartime()))
     }
 }
 
@@ -667,12 +740,12 @@ impl<const LIMBS: usize> ArithmeticBackend for CryptoUint<LIMBS> {
             .ok_or(Error::Composite)
     }
 
-    fn jacobi(&self, modulus: &Self) -> Result<i8> {
-        let Some(odd) = crypto_bigint::Odd::new(modulus.0).into_option() else {
-            return Ok(0);
-        };
-        let reduced = self.0.rem_vartime(odd.as_nz_ref());
-        Ok(reduced.jacobi_symbol_vartime(&odd).into())
+    // No `jacobi` override: `Uint::jacobi_symbol_vartime` in crypto-bigint
+    // 0.7.5 returns an incorrect sign for some multi-limb inputs (verified
+    // against GMP and two independent implementations), so the generic
+    // default is used instead.
+    fn sqrt(&self) -> Result<Self> {
+        Ok(Self(self.0.floor_sqrt_vartime()))
     }
 }
 
@@ -1090,6 +1163,42 @@ mod tests {
         assert_eq!(zero.gcd(&seven).unwrap().to_be_bytes(), [7]);
         assert_eq!(seven.gcd(&zero).unwrap().to_be_bytes(), [7]);
 
+        assert!(zero.sqrt().unwrap().is_zero());
+        assert!(one.sqrt().unwrap().is_one());
+        assert_eq!(eight.sqrt().unwrap().to_be_bytes(), [2]);
+        assert_eq!(
+            B::from_be_bytes(&[9])
+                .unwrap()
+                .sqrt()
+                .unwrap()
+                .to_be_bytes(),
+            [3]
+        );
+        assert_eq!(
+            B::from_be_bytes(&[15])
+                .unwrap()
+                .sqrt()
+                .unwrap()
+                .to_be_bytes(),
+            [3]
+        );
+        assert_eq!(
+            B::from_be_bytes(&[16])
+                .unwrap()
+                .sqrt()
+                .unwrap()
+                .to_be_bytes(),
+            [4]
+        );
+        assert_eq!(
+            B::from_be_bytes(&[1, 0])
+                .unwrap()
+                .sqrt()
+                .unwrap()
+                .to_be_bytes(),
+            [16]
+        );
+
         assert_eq!(three.modular_inverse(&seven).unwrap().to_be_bytes(), [5]);
         assert!(matches!(
             two.modular_inverse(&four),
@@ -1130,6 +1239,18 @@ mod tests {
         operator_round_trip::<CryptoUint<8>>();
         method_round_trip::<CryptoBigint>();
         method_round_trip::<CryptoUint<8>>();
+    }
+
+    #[test]
+    #[cfg(feature = "crypto-bigint")]
+    fn crypto_bigint_inverse_modulo_one() {
+        // Every residue modulo one is zero, which is its own inverse, matching
+        // the trait default and the `num-bigint` and `rug` backends.
+        let one = CryptoBigint::from_be_bytes(&[1]).unwrap();
+        for value in [0u8, 1, 5, 255] {
+            let value = CryptoBigint::from_be_bytes(&[value]).unwrap();
+            assert!(value.modular_inverse(&one).unwrap().is_zero());
+        }
     }
 
     #[test]
