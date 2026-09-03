@@ -24,6 +24,70 @@ make an unaudited implementation immune to software defects.
 
 **USE AT YOUR OWN RISK.**
 
+## When to use ECPP
+
+Probabilistic tests answer "is this integer prime?" with overwhelming
+confidence for the party running them. A certificate answers it for everyone
+else. `ecpp` is the right tool when that difference matters:
+
+- **The integer comes from an untrusted party.** Miller–Rabin configurations
+  in widely used libraries have been fooled by adversarially constructed
+  composites ([Albrecht et al., *Prime and Prejudice*,
+  2018][prime-and-prejudice]). A verified certificate removes the question
+  instead of hardening the test.
+- **Someone else must check your parameters.** Cryptographic group and domain
+  parameters can ship with their certificate, and any party can verify them
+  deterministically — without randomness and without trusting the machine or
+  library that produced them.
+- **The claim outlives the computation.** Proving is a one-time cost; the
+  stored certificate verifies cheaply, repeatedly, and on a different bigint
+  backend than the one that produced it.
+- **An audit demands evidence.** "It passed sixty-four rounds of
+  Miller–Rabin" describes a past computation; a certificate is an artifact
+  the reviewer re-checks directly.
+
+Prefer a probabilistic test when none of that applies:
+
+| Tool | Verdict | Reach for it when |
+| --- | --- | --- |
+| [`glass_pumpkin`][glass-pumpkin] | probable prime | generating or screening primes over `num-bigint` |
+| [`crypto-primes`][crypto-primes] | probable prime | generating key material over `crypto-bigint` |
+| `rug::Integer::is_probably_prime` | probable prime | fast screening with GMP |
+| OpenSSL `BN_is_prime_ex` | probable prime | fast screening in an OpenSSL stack |
+| `ecpp` | proof | the primality claim must be independently verifiable |
+
+Probabilistic tests are orders of magnitude faster, and for secret primes
+they are the only appropriate choice: `ecpp` is variable-time by design and
+must never see secret values.
+
+### Measured costs
+
+One machine (Apple Silicon, release build), one deterministic prime per size
+(`next_prime(2^(bits−1) + 3)`); the rug and OpenSSL checks run 64 rounds,
+while `glass_pumpkin::prime::strong_check` runs a fixed small battery, which
+is why it is fastest. Proving time is dominated by how quickly the curve
+order search succeeds, so treat the prove columns as representative samples
+rather than smooth curves.
+
+| Bits | `strong_check` | rug check | OpenSSL check | verify (rug engine) | prove (rug engine) | prove (num-bigint) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 128 | 27 µs | 125 µs | 185 µs | 0.8 ms | 20 ms | 118 ms |
+| 192 | 44 µs | 251 µs | 327 µs | 1.4 ms | 53 ms | 381 ms |
+| 256 | 73 µs | 393 µs | 381 µs | 2.6 ms | 22 s | 56 s |
+| 320 | 103 µs | 630 µs | 903 µs | 7.6 ms | 25 s | 69 s |
+| 384 | 157 µs | 825 µs | 1.4 ms | 6.8 ms | 82 s | 248 s |
+| 512 | 315 µs | 1.6 ms | 1.8 ms | 13 ms | 168 s | 456 s |
+
+Two things follow from the table. Verifying a stored certificate costs the
+same order of magnitude as re-running a strong probabilistic check, so the
+one-time proving cost buys checks that are nearly free thereafter. And the
+practical proving envelope of the current search bounds ends near 512 bits:
+distinct 512-bit candidates prove in minutes (generation retries past the
+occasional `Error::SearchExhausted`), while a 1024-bit attempt exhausts the
+bounded factor search after a few minutes. Probabilistic screening keeps
+going far beyond that — a 64-round GMP check costs roughly 10 ms at 1024
+bits and 3 s at 8192 bits.
+
 ## Installation
 
 The default features enable allocation, `std`, operating-system randomness,
@@ -268,8 +332,11 @@ The prover constructs an Atkin–Morain ECPP chain. At each level it:
 6. Reduces the proof of `n` to a proof of the smaller `q`.
 7. Terminates at a 64-bit prime checked by deterministic Miller–Rabin.
 
-The CM search includes the `j = 0` and `j = 1728` supersingular cases and all
-fundamental imaginary quadratic discriminants of class number one or two.
+The CM search includes the `j = 0` and `j = 1728` supersingular cases, all
+fundamental imaginary quadratic discriminants of class number one and two, and
+the twelve class-number-three discriminants whose Hilbert class polynomial
+coefficients fit 128 bits. Cubic class polynomials are split modulo `n` with
+randomized Cantor–Zassenhaus factoring.
 
 Each [`EcppStep`](https://docs.rs/ecpp/latest/ecpp/struct.EcppStep.html) records:
 
@@ -414,6 +481,8 @@ conditions.
 [broker-stevenhagen]: https://arxiv.org/abs/math/0111159
 [cheng]: https://www.iacr.org/archive/crypto2003/27290337/27290337.pdf
 [cohen]: https://doi.org/10.1007/978-3-662-02945-9
+[crypto-primes]: https://github.com/entropyxyz/crypto-primes
+[prime-and-prejudice]: https://eprint.iacr.org/2018/749
 [cornacchia]: https://www.lix.polytechnique.fr/~morain/Articles/cornac.pdf
 [ecpp-home]: https://www.lix.polytechnique.fr/~morain/Prgms/ecpp.english.html
 [fast-ecpp]: https://www.lix.polytechnique.fr/~morain/Articles/fastecpp-final.pdf

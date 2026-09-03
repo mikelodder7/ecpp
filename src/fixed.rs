@@ -48,6 +48,18 @@ pub struct ProverOptions {
     pub trial_division_limit: u32,
     /// The number of random x-coordinates tried for each candidate curve.
     pub point_attempts: u32,
+    /// The largest CM class number searched, between one and three.
+    ///
+    /// The allocation-free prover defaults to two so constrained targets
+    /// skip the polynomial-splitting cost of the class-number-three
+    /// discriminants; raise it to three to search the full table.
+    pub max_class_number: u8,
+    /// The number of ECM escalation rounds tried, up to three, when Pollard
+    /// rho fails to split a curve-order cofactor of at least 384 bits.
+    ///
+    /// The allocation-free prover defaults to zero so constrained targets
+    /// never pay for ECM; raise it to search deeper factor ranges.
+    pub ecm_rounds: u8,
 }
 
 impl Default for ProverOptions {
@@ -55,6 +67,8 @@ impl Default for ProverOptions {
         Self {
             trial_division_limit: 10_000,
             point_attempts: 128,
+            max_class_number: 2,
+            ecm_rounds: 0,
         }
     }
 }
@@ -396,10 +410,13 @@ fn find_step<const LIMBS: usize, R: CryptoRng + ?Sized>(
     }
 
     for discriminant in DISCRIMINANTS {
+        if discriminant.polynomial.class_number() > options.max_class_number {
+            continue;
+        }
         let Some((trace, _)) = cornacchia(candidate, discriminant.value) else {
             continue;
         };
-        let Some(j_values) = j_invariants(candidate, discriminant.polynomial) else {
+        let Some(j_values) = j_invariants(candidate, discriminant.polynomial, rng) else {
             continue;
         };
         for j in j_values.into_iter().flatten() {
@@ -431,7 +448,7 @@ fn try_order<const LIMBS: usize, R: CryptoRng + ?Sized>(
     rng: &mut R,
     options: ProverOptions,
 ) -> Result<Option<WorkingStep<LIMBS>>> {
-    let Some(q) = split_order(candidate, order, options.trial_division_limit, rng) else {
+    let Some(q) = split_order(candidate, order, options, rng) else {
         return Ok(None);
     };
     let Some(q_nonzero) = nonzero(q) else {
@@ -471,11 +488,11 @@ fn try_order<const LIMBS: usize, R: CryptoRng + ?Sized>(
 fn split_order<const LIMBS: usize, R: CryptoRng + ?Sized>(
     candidate: &Uint<LIMBS>,
     order: &Uint<LIMBS>,
-    trial_limit: u32,
+    options: ProverOptions,
     rng: &mut R,
 ) -> Option<Uint<LIMBS>> {
     let mut remaining = *order;
-    for prime in 2..=trial_limit {
+    for prime in 2..=options.trial_division_limit {
         if !is_prime_u32(prime) {
             continue;
         }
@@ -489,24 +506,34 @@ fn split_order<const LIMBS: usize, R: CryptoRng + ?Sized>(
         .into_option()?
         .checked_mul(&fourth_root.checked_add(&Uint::ONE).into_option()?)
         .into_option()?;
-    find_large_prime_factor(&remaining, candidate, &bound, trial_limit, rng, 0)
+    find_large_prime_factor(&remaining, candidate, &bound, options, rng, 0)
 }
+
+/// The smallest cofactor width where ECM escalation is attempted after
+/// Pollard rho fails; below it, rho already covers the reachable factors.
+const ECM_MINIMUM_BITS: u32 = 384;
 
 fn find_large_prime_factor<const LIMBS: usize, R: CryptoRng + ?Sized>(
     value: &Uint<LIMBS>,
     candidate: &Uint<LIMBS>,
     bound: &Uint<LIMBS>,
-    trial_limit: u32,
+    options: ProverOptions,
     rng: &mut R,
     depth: usize,
 ) -> Option<Uint<LIMBS>> {
     if value <= bound || depth > 32 {
         return None;
     }
-    if is_probable_prime(value, trial_limit.max(53)) {
+    if is_probable_prime(value, options.trial_division_limit.max(53)) {
         return (*value < *candidate).then_some(*value);
     }
-    let factor = pollard_rho(value, rng)?;
+    let factor = match pollard_rho(value, rng) {
+        Some(factor) => factor,
+        None if options.ecm_rounds > 0 && value.bits_vartime() >= ECM_MINIMUM_BITS => {
+            ecm(value, options.ecm_rounds, rng)?
+        }
+        None => return None,
+    };
     let factor_nonzero = nonzero(factor)?;
     let (other, remainder) = value.div_rem_vartime(&factor_nonzero);
     if remainder != Uint::ZERO {
@@ -517,8 +544,177 @@ fn find_large_prime_factor<const LIMBS: usize, R: CryptoRng + ?Sized>(
     } else {
         (other, factor)
     };
-    find_large_prime_factor(&first, candidate, bound, trial_limit, rng, depth + 1)
-        .or_else(|| find_large_prime_factor(&second, candidate, bound, trial_limit, rng, depth + 1))
+    find_large_prime_factor(&first, candidate, bound, options, rng, depth + 1)
+        .or_else(|| find_large_prime_factor(&second, candidate, bound, options, rng, depth + 1))
+}
+
+/// A projective x-only point on a Montgomery curve modulo the composite
+/// being factored.
+#[derive(Clone, Copy)]
+struct MontgomeryPoint<const LIMBS: usize> {
+    x: Uint<LIMBS>,
+    z: Uint<LIMBS>,
+}
+
+/// x-only Montgomery curve arithmetic modulo the composite being factored,
+/// parameterized by `a24 = (A + 2) / 4`.
+struct EcmCurve<'a, const LIMBS: usize> {
+    modulus: &'a NonZero<Uint<LIMBS>>,
+    a24: Uint<LIMBS>,
+}
+
+impl<const LIMBS: usize> EcmCurve<'_, LIMBS> {
+    fn double(&self, point: &MontgomeryPoint<LIMBS>) -> MontgomeryPoint<LIMBS> {
+        let sum = point.x.add_mod(&point.z, self.modulus);
+        let sum_squared = sum.mul_mod_vartime(&sum, self.modulus);
+        let difference = point.x.sub_mod(&point.z, self.modulus);
+        let difference_squared = difference.mul_mod_vartime(&difference, self.modulus);
+        let x = sum_squared.mul_mod_vartime(&difference_squared, self.modulus);
+        let four_xz = sum_squared.sub_mod(&difference_squared, self.modulus);
+        let scaled = self.a24.mul_mod_vartime(&four_xz, self.modulus);
+        let z = four_xz.mul_mod_vartime(
+            &difference_squared.add_mod(&scaled, self.modulus),
+            self.modulus,
+        );
+        MontgomeryPoint { x, z }
+    }
+
+    fn add(
+        &self,
+        left: &MontgomeryPoint<LIMBS>,
+        right: &MontgomeryPoint<LIMBS>,
+        difference: &MontgomeryPoint<LIMBS>,
+    ) -> MontgomeryPoint<LIMBS> {
+        let left_minus = left.x.sub_mod(&left.z, self.modulus);
+        let left_plus = left.x.add_mod(&left.z, self.modulus);
+        let right_minus = right.x.sub_mod(&right.z, self.modulus);
+        let right_plus = right.x.add_mod(&right.z, self.modulus);
+        let cross_one = left_minus.mul_mod_vartime(&right_plus, self.modulus);
+        let cross_two = left_plus.mul_mod_vartime(&right_minus, self.modulus);
+        let sum = cross_one.add_mod(&cross_two, self.modulus);
+        let difference_of_crosses = cross_one.sub_mod(&cross_two, self.modulus);
+        let x = difference
+            .z
+            .mul_mod_vartime(&sum.mul_mod_vartime(&sum, self.modulus), self.modulus);
+        let z = difference.x.mul_mod_vartime(
+            &difference_of_crosses.mul_mod_vartime(&difference_of_crosses, self.modulus),
+            self.modulus,
+        );
+        MontgomeryPoint { x, z }
+    }
+
+    fn ladder(&self, scalar: u32, point: &MontgomeryPoint<LIMBS>) -> MontgomeryPoint<LIMBS> {
+        if scalar == 0 {
+            return MontgomeryPoint {
+                x: Uint::ONE,
+                z: Uint::ZERO,
+            };
+        }
+        if scalar == 1 {
+            return *point;
+        }
+        let mut lower = *point;
+        let mut upper = self.double(point);
+        let bits = 32 - scalar.leading_zeros();
+        for index in (0..bits - 1).rev() {
+            if scalar & (1 << index) != 0 {
+                lower = self.add(&lower, &upper, point);
+                upper = self.double(&upper);
+            } else {
+                upper = self.add(&lower, &upper, point);
+                lower = self.double(&lower);
+            }
+        }
+        lower
+    }
+}
+
+/// Runs one Suyama-parameterized ECM curve and returns a nontrivial factor
+/// when stage one finds one.
+fn ecm_curve_attempt<const LIMBS: usize, R: CryptoRng + ?Sized>(
+    value: &Uint<LIMBS>,
+    bound1: u32,
+    rng: &mut R,
+) -> Option<Uint<LIMBS>> {
+    let modulus = nonzero(*value)?;
+    let sigma = Uint::random_mod_vartime(rng, &modulus);
+    if sigma < Uint::from(6u8) {
+        return None;
+    }
+    let sigma_squared = sigma.mul_mod_vartime(&sigma, &modulus);
+    let u = sigma_squared.sub_mod(&Uint::from(5u8), &modulus);
+    let v = sigma.mul_mod_vartime(&Uint::from(4u8), &modulus);
+    if u == Uint::ZERO || v == Uint::ZERO {
+        return None;
+    }
+    let u_squared = u.mul_mod_vartime(&u, &modulus);
+    let u_cubed = u_squared.mul_mod_vartime(&u, &modulus);
+    let v_squared = v.mul_mod_vartime(&v, &modulus);
+    let v_cubed = v_squared.mul_mod_vartime(&v, &modulus);
+
+    // a24 = (v − u)³ (3u + v) / (16 u³ v) for the curve constant.
+    let difference = v.sub_mod(&u, &modulus);
+    let difference_squared = difference.mul_mod_vartime(&difference, &modulus);
+    let difference_cubed = difference_squared.mul_mod_vartime(&difference, &modulus);
+    let three_u_plus_v = u
+        .mul_mod_vartime(&Uint::from(3u8), &modulus)
+        .add_mod(&v, &modulus);
+    let numerator = difference_cubed.mul_mod_vartime(&three_u_plus_v, &modulus);
+    let denominator = u_cubed
+        .mul_mod_vartime(&v, &modulus)
+        .mul_mod_vartime(&Uint::from(16u8), &modulus);
+    let shared = denominator.gcd_vartime(value);
+    if shared != Uint::ONE {
+        // A degenerate parameterization either exposes a factor directly or
+        // collapses entirely; only the former is usable.
+        return (shared != *value).then_some(shared);
+    }
+    let inverse = denominator.invert_mod(&modulus).into_option()?;
+    let a24 = numerator.mul_mod_vartime(&inverse, &modulus);
+
+    let curve = EcmCurve {
+        modulus: &modulus,
+        a24,
+    };
+    let mut point = MontgomeryPoint {
+        x: u_cubed,
+        z: v_cubed,
+    };
+    let limit = u64::from(bound1);
+    let mut prime = 2u32;
+    while prime <= bound1 {
+        if is_prime_u32(prime) {
+            let mut power = u64::from(prime);
+            loop {
+                point = curve.ladder(prime, &point);
+                power = power.saturating_mul(u64::from(prime));
+                if power > limit {
+                    break;
+                }
+            }
+        }
+        prime += 1;
+    }
+    let shared = point.z.gcd_vartime(value);
+    (shared != Uint::ONE && shared != *value).then_some(shared)
+}
+
+/// Lenstra's elliptic curve method, tried after Pollard rho fails on a
+/// large cofactor. Rounds escalate the stage-one bound and curve count.
+fn ecm<const LIMBS: usize, R: CryptoRng + ?Sized>(
+    value: &Uint<LIMBS>,
+    rounds: u8,
+    rng: &mut R,
+) -> Option<Uint<LIMBS>> {
+    const ECM_ROUNDS: [(u32, u32); 3] = [(11_000, 20), (50_000, 40), (250_000, 80)];
+    for (bound1, curves) in ECM_ROUNDS.iter().take(usize::from(rounds)) {
+        for _ in 0..*curves {
+            if let Some(factor) = ecm_curve_attempt(value, *bound1, rng) {
+                return Some(factor);
+            }
+        }
+    }
+    None
 }
 
 fn pollard_rho<const LIMBS: usize, R: CryptoRng + ?Sized>(
@@ -565,37 +761,283 @@ fn rho_step<const LIMBS: usize>(
         .add_mod(constant, modulus)
 }
 
-fn j_invariants<const LIMBS: usize>(
+fn negate<const LIMBS: usize>(value: &Uint<LIMBS>, modulus: &Uint<LIMBS>) -> Uint<LIMBS> {
+    if *value == Uint::ZERO {
+        Uint::ZERO
+    } else {
+        modulus.wrapping_sub(value)
+    }
+}
+
+fn quadratic_roots<const LIMBS: usize>(
+    candidate: &Uint<LIMBS>,
+    linear_mod: &Uint<LIMBS>,
+    constant_mod: &Uint<LIMBS>,
+) -> Option<(Uint<LIMBS>, Uint<LIMBS>)> {
+    let modulus = nonzero(*candidate)?;
+    let four_constant = constant_mod.mul_mod_vartime(&Uint::from(4u8), &modulus);
+    let discriminant = linear_mod
+        .mul_mod_vartime(linear_mod, &modulus)
+        .sub_mod(&four_constant, &modulus);
+    let square_root = modular_sqrt(&discriminant, candidate)?;
+    let inverse_two = candidate
+        .checked_add(&Uint::ONE)
+        .into_option()?
+        .shr_vartime(1);
+    let minus_linear = negate(linear_mod, candidate);
+    let first = minus_linear
+        .sub_mod(&square_root, &modulus)
+        .mul_mod_vartime(&inverse_two, &modulus);
+    let second = minus_linear
+        .add_mod(&square_root, &modulus)
+        .mul_mod_vartime(&inverse_two, &modulus);
+    Some((first, second))
+}
+
+/// A monic cubic `x³ + quadratic·x² + linear·x + constant` with coefficients
+/// reduced modulo the candidate, plus the precomputed reductions of `x³` and
+/// `x⁴` used to multiply residue polynomials of degree below three.
+struct CubicPolynomial<const LIMBS: usize> {
+    quadratic: Uint<LIMBS>,
+    linear: Uint<LIMBS>,
+    constant: Uint<LIMBS>,
+    x_cubed: [Uint<LIMBS>; 3],
+    x_fourth: [Uint<LIMBS>; 3],
+}
+
+impl<const LIMBS: usize> CubicPolynomial<LIMBS> {
+    fn new(
+        candidate: &Uint<LIMBS>,
+        quadratic: Uint<LIMBS>,
+        linear: Uint<LIMBS>,
+        constant: Uint<LIMBS>,
+    ) -> Option<Self> {
+        let modulus = nonzero(*candidate)?;
+        let x_cubed = [
+            negate(&constant, candidate),
+            negate(&linear, candidate),
+            negate(&quadratic, candidate),
+        ];
+        // x⁴ ≡ (q² − l)·x² + (q·l − c)·x + q·c below the cubic.
+        let q_squared = quadratic.mul_mod_vartime(&quadratic, &modulus);
+        let x_fourth = [
+            quadratic.mul_mod_vartime(&constant, &modulus),
+            quadratic
+                .mul_mod_vartime(&linear, &modulus)
+                .sub_mod(&constant, &modulus),
+            q_squared.sub_mod(&linear, &modulus),
+        ];
+        Some(Self {
+            quadratic,
+            linear,
+            constant,
+            x_cubed,
+            x_fourth,
+        })
+    }
+
+    fn evaluate(&self, modulus: &NonZero<Uint<LIMBS>>, x: &Uint<LIMBS>) -> Uint<LIMBS> {
+        let mut accumulator = x.add_mod(&self.quadratic, modulus);
+        accumulator = accumulator
+            .mul_mod_vartime(x, modulus)
+            .add_mod(&self.linear, modulus);
+        accumulator
+            .mul_mod_vartime(x, modulus)
+            .add_mod(&self.constant, modulus)
+    }
+
+    fn multiply(
+        &self,
+        modulus: &NonZero<Uint<LIMBS>>,
+        left: &[Uint<LIMBS>; 3],
+        right: &[Uint<LIMBS>; 3],
+    ) -> [Uint<LIMBS>; 3] {
+        let mut raw = [Uint::ZERO; 5];
+        for (i, left_coefficient) in left.iter().enumerate() {
+            for (j, right_coefficient) in right.iter().enumerate() {
+                let product = left_coefficient.mul_mod_vartime(right_coefficient, modulus);
+                raw[i + j] = raw[i + j].add_mod(&product, modulus);
+            }
+        }
+        let mut output = [raw[0], raw[1], raw[2]];
+        for (index, coefficient) in output.iter_mut().enumerate() {
+            let cubed = raw[3].mul_mod_vartime(&self.x_cubed[index], modulus);
+            let fourth = raw[4].mul_mod_vartime(&self.x_fourth[index], modulus);
+            *coefficient = coefficient
+                .add_mod(&cubed, modulus)
+                .add_mod(&fourth, modulus);
+        }
+        output
+    }
+
+    fn power(
+        &self,
+        modulus: &NonZero<Uint<LIMBS>>,
+        base: &[Uint<LIMBS>; 3],
+        exponent: &Uint<LIMBS>,
+    ) -> [Uint<LIMBS>; 3] {
+        let mut output = [Uint::ONE, Uint::ZERO, Uint::ZERO];
+        let mut base = *base;
+        let bits = exponent.bits_vartime();
+        for index in 0..bits {
+            if exponent.bit_vartime(index) {
+                output = self.multiply(modulus, &output, &base);
+            }
+            if index + 1 < bits {
+                base = self.multiply(modulus, &base, &base);
+            }
+        }
+        output
+    }
+}
+
+fn trim_length<const LIMBS: usize>(polynomial: &[Uint<LIMBS>; 4], mut length: usize) -> usize {
+    while length > 0 && polynomial[length - 1] == Uint::ZERO {
+        length -= 1;
+    }
+    length
+}
+
+fn polynomial_rem<const LIMBS: usize>(
+    modulus: &NonZero<Uint<LIMBS>>,
+    dividend: &[Uint<LIMBS>; 4],
+    dividend_length: usize,
+    divisor: &[Uint<LIMBS>; 4],
+    divisor_length: usize,
+) -> Option<([Uint<LIMBS>; 4], usize)> {
+    let divisor_degree = divisor_length - 1;
+    let lead_inverse = divisor[divisor_degree].invert_mod(modulus).into_option()?;
+    let mut remainder = *dividend;
+    let mut length = dividend_length;
+    while length > divisor_degree {
+        let top = length - 1;
+        let coefficient = remainder[top];
+        if coefficient != Uint::ZERO {
+            let factor = coefficient.mul_mod_vartime(&lead_inverse, modulus);
+            let shift = top - divisor_degree;
+            for (offset, divisor_coefficient) in divisor.iter().take(divisor_length).enumerate() {
+                let subtrahend = factor.mul_mod_vartime(divisor_coefficient, modulus);
+                remainder[shift + offset] = remainder[shift + offset].sub_mod(&subtrahend, modulus);
+            }
+        }
+        length -= 1;
+    }
+    Some((remainder, trim_length(&remainder, length)))
+}
+
+fn polynomial_gcd<const LIMBS: usize>(
+    modulus: &NonZero<Uint<LIMBS>>,
+    mut left: [Uint<LIMBS>; 4],
+    mut left_length: usize,
+    mut right: [Uint<LIMBS>; 4],
+    mut right_length: usize,
+) -> Option<([Uint<LIMBS>; 4], usize)> {
+    left_length = trim_length(&left, left_length);
+    right_length = trim_length(&right, right_length);
+    while right_length > 0 {
+        let (remainder, remainder_length) =
+            polynomial_rem(modulus, &left, left_length, &right, right_length)?;
+        left = right;
+        left_length = right_length;
+        right = remainder;
+        right_length = remainder_length;
+    }
+    Some((left, left_length))
+}
+
+/// Finds roots of a fully split monic cubic by Cantor–Zassenhaus splitting:
+/// `gcd(H, (x + r)^((n−1)/2) − 1)` isolates the roots whose shifted values
+/// are quadratic residues.
+fn cubic_roots<const LIMBS: usize, R: CryptoRng + ?Sized>(
+    candidate: &Uint<LIMBS>,
+    polynomial: &CubicPolynomial<LIMBS>,
+    rng: &mut R,
+) -> Option<[Option<Uint<LIMBS>>; 3]> {
+    let modulus = nonzero(*candidate)?;
+    let exponent = candidate.wrapping_sub(&Uint::ONE).shr_vartime(1);
+    let cubic = [
+        polynomial.constant,
+        polynomial.linear,
+        polynomial.quadratic,
+        Uint::ONE,
+    ];
+    for _ in 0..16 {
+        let shift = Uint::random_mod_vartime(rng, &modulus);
+        let base = [shift, Uint::ONE, Uint::ZERO];
+        let mut split = polynomial.power(&modulus, &base, &exponent);
+        split[0] = split[0].sub_mod(&Uint::ONE, &modulus);
+        let padded = [split[0], split[1], split[2], Uint::ZERO];
+        let (factor, factor_length) = polynomial_gcd(&modulus, cubic, 4, padded, 3)?;
+        let candidates = match factor_length {
+            2 => {
+                let inverse = factor[1].invert_mod(&modulus).into_option()?;
+                let root = negate(&factor[0], candidate).mul_mod_vartime(&inverse, &modulus);
+                // Deflate by the root: H = (x − r)(x² + p·x + q).
+                let deflated_linear = polynomial.quadratic.add_mod(&root, &modulus);
+                let deflated_constant = root
+                    .mul_mod_vartime(&deflated_linear, &modulus)
+                    .add_mod(&polynomial.linear, &modulus);
+                match quadratic_roots(candidate, &deflated_linear, &deflated_constant) {
+                    Some((second, third)) => [Some(root), Some(second), Some(third)],
+                    None => [Some(root), None, None],
+                }
+            }
+            3 => {
+                let inverse = factor[2].invert_mod(&modulus).into_option()?;
+                let monic_linear = factor[1].mul_mod_vartime(&inverse, &modulus);
+                let monic_constant = factor[0].mul_mod_vartime(&inverse, &modulus);
+                let Some((first, second)) =
+                    quadratic_roots(candidate, &monic_linear, &monic_constant)
+                else {
+                    continue;
+                };
+                // The root sum is −quadratic, which yields the third root.
+                let sum = first.add_mod(&second, &modulus);
+                let third = negate(&polynomial.quadratic, candidate).sub_mod(&sum, &modulus);
+                [Some(first), Some(second), Some(third)]
+            }
+            _ => continue,
+        };
+        let mut verified = [None; 3];
+        let mut count = 0;
+        for root in candidates.into_iter().flatten() {
+            if polynomial.evaluate(&modulus, &root) == Uint::ZERO {
+                verified[count] = Some(root);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            return Some(verified);
+        }
+    }
+    None
+}
+
+fn j_invariants<const LIMBS: usize, R: CryptoRng + ?Sized>(
     candidate: &Uint<LIMBS>,
     polynomial: ClassPolynomial,
-) -> Option<[Option<Uint<LIMBS>>; 2]> {
+    rng: &mut R,
+) -> Option<[Option<Uint<LIMBS>>; 3]> {
     match polynomial {
-        ClassPolynomial::Linear(root) => Some([Some(mod_signed(root, candidate)?), None]),
+        ClassPolynomial::Linear(root) => Some([Some(mod_signed(root, candidate)?), None, None]),
         ClassPolynomial::Quadratic { constant, linear } => {
-            let modulus = nonzero(*candidate)?;
             let linear_mod = mod_signed(linear, candidate)?;
             let constant_mod = mod_signed(constant, candidate)?;
-            let four_constant = constant_mod.mul_mod_vartime(&Uint::from(4u8), &modulus);
-            let discriminant = linear_mod
-                .mul_mod_vartime(&linear_mod, &modulus)
-                .sub_mod(&four_constant, &modulus);
-            let square_root = modular_sqrt(&discriminant, candidate)?;
-            let inverse_two = candidate
-                .checked_add(&Uint::ONE)
-                .into_option()?
-                .shr_vartime(1);
-            let minus_linear = if linear_mod == Uint::ZERO {
-                Uint::ZERO
-            } else {
-                candidate.wrapping_sub(&linear_mod)
-            };
-            let first = minus_linear
-                .sub_mod(&square_root, &modulus)
-                .mul_mod_vartime(&inverse_two, &modulus);
-            let second = minus_linear
-                .add_mod(&square_root, &modulus)
-                .mul_mod_vartime(&inverse_two, &modulus);
-            Some([Some(first), Some(second)])
+            let (first, second) = quadratic_roots(candidate, &linear_mod, &constant_mod)?;
+            Some([Some(first), Some(second), None])
+        }
+        ClassPolynomial::Cubic {
+            constant,
+            linear,
+            quadratic,
+        } => {
+            let polynomial = CubicPolynomial::new(
+                candidate,
+                mod_signed(quadratic, candidate)?,
+                mod_signed(linear, candidate)?,
+                mod_signed(constant, candidate)?,
+            )?;
+            cubic_roots(candidate, &polynomial, rng)
         }
     }
 }
@@ -1265,6 +1707,74 @@ mod tests {
         let generated: crate::ProvedPrime<U256, PrimalityProof<{ U256::BYTES }, 8>> =
             from_rng(16, &mut rng).unwrap();
         generated.proof.verify_for(&generated.prime).unwrap();
+    }
+
+    #[test]
+    fn default_options_stop_at_class_number_two() {
+        assert_eq!(ProverOptions::default().max_class_number, 2);
+        assert_eq!(ProverOptions::default().ecm_rounds, 0);
+    }
+
+    #[test]
+    fn ecm_splits_a_semiprime_beyond_trial_range() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let first = U256::from(1_000_000_007u64);
+        let second = U256::from(1_000_000_009u64);
+        let value = first.wrapping_mul(&second);
+        let factor = ecm(&value, 2, &mut rng).unwrap();
+        assert!(factor == first || factor == second);
+    }
+
+    #[test]
+    fn full_table_opt_in_proves() {
+        let mut rng = StdRng::seed_from_u64(53);
+        let options = ProverOptions {
+            max_class_number: 3,
+            ..ProverOptions::default()
+        };
+        let proof: PrimalityProof<{ U256::BYTES }, 8> =
+            prove_with_options(&U256::from(65_537u32), &mut rng, options).unwrap();
+        proof.verify_for(&U256::from(65_537u32)).unwrap();
+    }
+
+    #[test]
+    fn cubic_class_polynomial_splits_for_represented_primes() {
+        use crate::cm::{ClassPolynomial, DISCRIMINANTS};
+
+        let cubic_entry = DISCRIMINANTS
+            .iter()
+            .find(|discriminant| discriminant.value == -23)
+            .expect("table contains -23");
+        let ClassPolynomial::Cubic {
+            constant,
+            linear,
+            quadratic,
+        } = cubic_entry.polynomial
+        else {
+            panic!("-23 should be cubic");
+        };
+
+        let mut rng = StdRng::seed_from_u64(5);
+        // 4·59 = 12² + 23·2² and 4·101 = 6² + 23·4², so H₋₂₃ splits
+        // completely modulo both primes.
+        for prime in [59u32, 101] {
+            let candidate = U256::from(prime);
+            let modulus = nonzero(candidate).unwrap();
+            let polynomial = CubicPolynomial::new(
+                &candidate,
+                mod_signed(quadratic, &candidate).unwrap(),
+                mod_signed(linear, &candidate).unwrap(),
+                mod_signed(constant, &candidate).unwrap(),
+            )
+            .unwrap();
+            let roots = cubic_roots(&candidate, &polynomial, &mut rng).unwrap();
+            let mut count = 0;
+            for root in roots.into_iter().flatten() {
+                assert_eq!(polynomial.evaluate(&modulus, &root), U256::ZERO);
+                count += 1;
+            }
+            assert_eq!(count, 3, "prime {prime} should split completely");
+        }
     }
 
     #[test]
