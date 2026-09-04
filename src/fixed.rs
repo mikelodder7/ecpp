@@ -13,7 +13,7 @@ use crypto_bigint::{
 };
 use rand_core::CryptoRng;
 
-use crate::cm::{ClassPolynomial, DISCRIMINANTS};
+use crate::cm::{ClassPolynomial, DISCRIMINANTS, MAX_CLASS_NUMBER, SignedMagnitude};
 
 /// Default maximum number of nodes in a fixed-capacity proof.
 pub const DEFAULT_PROOF_NODES: usize = 64;
@@ -48,11 +48,11 @@ pub struct ProverOptions {
     pub trial_division_limit: u32,
     /// The number of random x-coordinates tried for each candidate curve.
     pub point_attempts: u32,
-    /// The largest CM class number searched, between one and three.
+    /// The largest CM class number searched, up to eight.
     ///
     /// The allocation-free prover defaults to two so constrained targets
-    /// skip the polynomial-splitting cost of the class-number-three
-    /// discriminants; raise it to three to search the full table.
+    /// skip the polynomial-splitting cost of higher class numbers; raise it
+    /// to search more of the table.
     pub max_class_number: u8,
     /// The number of ECM escalation rounds tried, up to three, when Pollard
     /// rho fails to split a curve-order cofactor of at least 384 bits.
@@ -60,6 +60,9 @@ pub struct ProverOptions {
     /// The allocation-free prover defaults to zero so constrained targets
     /// never pay for ECM; raise it to search deeper factor ranges.
     pub ecm_rounds: u8,
+    /// The total number of curve orders the backtracking search may attempt
+    /// across every level and retry before reporting exhaustion.
+    pub search_budget: u32,
 }
 
 impl Default for ProverOptions {
@@ -69,6 +72,7 @@ impl Default for ProverOptions {
             point_attempts: 128,
             max_class_number: 2,
             ecm_rounds: 0,
+            search_budget: 1024,
         }
     }
 }
@@ -228,6 +232,13 @@ impl<const BYTES: usize, const NODES: usize> PrimalityProof<BYTES, NODES> {
         self.len += 1;
         Ok(())
     }
+
+    fn pop(&mut self) {
+        if self.len > 0 {
+            self.len -= 1;
+            self.nodes[self.len] = None;
+        }
+    }
 }
 
 /// Constructs an allocation-free ECPP proof using `rng`.
@@ -264,22 +275,15 @@ pub fn prove_with_options<
     }
 
     let mut proof = PrimalityProof::new();
-    let mut current = *candidate;
-    loop {
-        if let Some(small) = to_u64(&current) {
-            if !is_prime_u64(small) {
-                return Err(Error::Composite);
-            }
-            proof.push(ProofNode::SmallPrime(small))?;
-            return Ok(proof);
-        }
-        if proof.len + 1 >= NODES {
-            return Err(Error::CapacityExhausted);
-        }
-        let step = find_step(&current, rng, options)?;
-        current = step.q;
-        proof.push(ProofNode::EllipticCurve(encode_step(&step)?))?;
+    let mut context = SearchContext {
+        rng,
+        options,
+        budget: options.search_budget,
+    };
+    if descend(candidate, &mut context, &mut proof)? {
+        return Ok(proof);
     }
+    Err(Error::SearchExhausted)
 }
 
 /// Constructs a proof using the operating-system RNG.
@@ -383,19 +387,57 @@ enum AffinePoint<const LIMBS: usize> {
     Finite { x: Uint<LIMBS>, y: Uint<LIMBS> },
 }
 
-fn find_step<const LIMBS: usize, R: CryptoRng + ?Sized>(
-    candidate: &Uint<LIMBS>,
-    rng: &mut R,
+struct SearchContext<'a, R: ?Sized> {
+    rng: &'a mut R,
     options: ProverOptions,
-) -> Result<WorkingStep<LIMBS>> {
-    if let Some(order) = candidate.checked_add(&Uint::ONE).into_option() {
+    budget: u32,
+}
+
+/// Full-table sweeps allowed per level before backtracking further up; every
+/// sweep after the first re-rolls the randomized factoring and point search.
+const MAX_LEVEL_SWEEPS: u32 = 4;
+
+enum StepOutcome {
+    /// The step and everything below it verified; the chain is complete.
+    Proved,
+    /// The order was consumed without completing a chain.
+    Failed,
+    /// No order attempt was possible (budget exhausted).
+    Exhausted,
+}
+
+/// Depth-first ECPP descent with backtracking: each level tries every curve
+/// order the CM search yields, and a failure below abandons only that branch
+/// rather than the whole proof.
+fn descend<const LIMBS: usize, const BYTES: usize, const NODES: usize, R: CryptoRng + ?Sized>(
+    candidate: &Uint<LIMBS>,
+    context: &mut SearchContext<'_, R>,
+    proof: &mut PrimalityProof<BYTES, NODES>,
+) -> Result<bool> {
+    if let Some(small) = to_u64(candidate) {
+        if is_prime_u64(small) {
+            proof.push(ProofNode::SmallPrime(small))?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if proof.len + 1 >= NODES {
+        return Ok(false);
+    }
+    let Some(order) = candidate.checked_add(&Uint::ONE).into_option() else {
+        return Ok(false);
+    };
+    for _ in 0..MAX_LEVEL_SWEEPS {
+        let mut orders_tried = false;
         if rem_u32(candidate, 4) == 3 {
             let curve = AffineCurve {
                 a: Uint::ONE,
                 b: Uint::ZERO,
             };
-            if let Some(step) = try_order(candidate, &order, &curve, None, rng, options)? {
-                return Ok(step);
+            match attempt_step(candidate, &order, &curve, None, context, proof)? {
+                StepOutcome::Proved => return Ok(true),
+                StepOutcome::Failed => orders_tried = true,
+                StepOutcome::Exhausted => return Ok(false),
             }
         }
         if rem_u32(candidate, 3) == 2 {
@@ -403,60 +445,87 @@ fn find_step<const LIMBS: usize, R: CryptoRng + ?Sized>(
                 a: Uint::ZERO,
                 b: Uint::ONE,
             };
-            if let Some(step) = try_order(candidate, &order, &curve, None, rng, options)? {
-                return Ok(step);
+            match attempt_step(candidate, &order, &curve, None, context, proof)? {
+                StepOutcome::Proved => return Ok(true),
+                StepOutcome::Failed => orders_tried = true,
+                StepOutcome::Exhausted => return Ok(false),
             }
         }
-    }
 
-    for discriminant in DISCRIMINANTS {
-        if discriminant.polynomial.class_number() > options.max_class_number {
-            continue;
-        }
-        let Some((trace, _)) = cornacchia(candidate, discriminant.value) else {
-            continue;
-        };
-        let Some(j_values) = j_invariants(candidate, discriminant.polynomial, rng) else {
-            continue;
-        };
-        for j in j_values.into_iter().flatten() {
-            let base = curve_from_j(candidate, &j)?;
-            let twist = quadratic_twist(candidate, &base)?;
-            let Some(n_plus_one) = candidate.checked_add(&Uint::ONE).into_option() else {
+        for discriminant in DISCRIMINANTS {
+            if discriminant.polynomial.class_number() > context.options.max_class_number {
+                continue;
+            }
+            if context.budget == 0 {
+                return Ok(false);
+            }
+            let Some((trace, _)) = cornacchia(candidate, discriminant.value) else {
                 continue;
             };
-            let orders = [
-                n_plus_one.checked_sub(&trace).into_option(),
-                n_plus_one.checked_add(&trace).into_option(),
-            ];
-            for order in orders.into_iter().flatten() {
-                if let Some(step) = try_order(candidate, &order, &base, Some(&twist), rng, options)?
-                {
-                    return Ok(step);
+            let Some(j_values) =
+                j_invariants(candidate, discriminant.polynomial, &mut *context.rng)
+            else {
+                continue;
+            };
+            for j in j_values.into_iter().flatten() {
+                let base = curve_from_j(candidate, &j)?;
+                let twist = quadratic_twist(candidate, &base)?;
+                let orders = [
+                    order.checked_sub(&trace).into_option(),
+                    order.checked_add(&trace).into_option(),
+                ];
+                for curve_order in orders.into_iter().flatten() {
+                    match attempt_step(
+                        candidate,
+                        &curve_order,
+                        &base,
+                        Some(&twist),
+                        context,
+                        proof,
+                    )? {
+                        StepOutcome::Proved => return Ok(true),
+                        StepOutcome::Failed => orders_tried = true,
+                        StepOutcome::Exhausted => return Ok(false),
+                    }
                 }
             }
         }
+        if !orders_tried {
+            return Ok(false);
+        }
     }
-    Err(Error::SearchExhausted)
+    Ok(false)
 }
 
-fn try_order<const LIMBS: usize, R: CryptoRng + ?Sized>(
+/// Attempts one candidate curve order: split off a certifying prime, find a
+/// point, then recurse; on failure below, pop the step and report so the
+/// caller can try the next order.
+fn attempt_step<
+    const LIMBS: usize,
+    const BYTES: usize,
+    const NODES: usize,
+    R: CryptoRng + ?Sized,
+>(
     candidate: &Uint<LIMBS>,
     order: &Uint<LIMBS>,
     curve: &AffineCurve<LIMBS>,
     twist: Option<&AffineCurve<LIMBS>>,
-    rng: &mut R,
-    options: ProverOptions,
-) -> Result<Option<WorkingStep<LIMBS>>> {
-    let Some(q) = split_order(candidate, order, options, rng) else {
-        return Ok(None);
+    context: &mut SearchContext<'_, R>,
+    proof: &mut PrimalityProof<BYTES, NODES>,
+) -> Result<StepOutcome> {
+    if context.budget == 0 {
+        return Ok(StepOutcome::Exhausted);
+    }
+    context.budget -= 1;
+    let Some(q) = split_order(candidate, order, context.options, &mut *context.rng) else {
+        return Ok(StepOutcome::Failed);
     };
     let Some(q_nonzero) = nonzero(q) else {
-        return Ok(None);
+        return Ok(StepOutcome::Failed);
     };
     let (cofactor, remainder) = order.div_rem_vartime(&q_nonzero);
     if remainder != Uint::ZERO {
-        return Ok(None);
+        return Ok(StepOutcome::Failed);
     }
     for candidate_curve in core::iter::once(curve).chain(twist) {
         if let Some(point) = find_point_of_order(
@@ -464,13 +533,13 @@ fn try_order<const LIMBS: usize, R: CryptoRng + ?Sized>(
             candidate_curve,
             &cofactor,
             &q,
-            rng,
-            options.point_attempts,
+            &mut *context.rng,
+            context.options.point_attempts,
         )? {
             let AffinePoint::Finite { x, y } = point else {
-                return Ok(None);
+                return Ok(StepOutcome::Failed);
             };
-            return Ok(Some(WorkingStep {
+            let step = WorkingStep {
                 n: *candidate,
                 curve: AffineCurve {
                     a: candidate_curve.a,
@@ -479,10 +548,16 @@ fn try_order<const LIMBS: usize, R: CryptoRng + ?Sized>(
                 point: PointValue { x, y },
                 cofactor,
                 q,
-            }));
+            };
+            proof.push(ProofNode::EllipticCurve(encode_step(&step)?))?;
+            if descend(&q, context, proof)? {
+                return Ok(StepOutcome::Proved);
+            }
+            proof.pop();
+            return Ok(StepOutcome::Failed);
         }
     }
-    Ok(None)
+    Ok(StepOutcome::Failed)
 }
 
 fn split_order<const LIMBS: usize, R: CryptoRng + ?Sized>(
@@ -794,250 +869,288 @@ fn quadratic_roots<const LIMBS: usize>(
     Some((first, second))
 }
 
-/// A monic cubic `x³ + quadratic·x² + linear·x + constant` with coefficients
-/// reduced modulo the candidate, plus the precomputed reductions of `x³` and
-/// `x⁴` used to multiply residue polynomials of degree below three.
-struct CubicPolynomial<const LIMBS: usize> {
-    quadratic: Uint<LIMBS>,
-    linear: Uint<LIMBS>,
-    constant: Uint<LIMBS>,
-    x_cubed: [Uint<LIMBS>; 3],
-    x_fourth: [Uint<LIMBS>; 3],
+/// Reduces a stored signed big-endian constant modulo the candidate by
+/// Horner's rule, so the fixed working width never decodes the full
+/// magnitude.
+fn reduce_signed_magnitude<const LIMBS: usize>(
+    coefficient: &SignedMagnitude,
+    candidate: &Uint<LIMBS>,
+) -> Option<Uint<LIMBS>> {
+    let modulus = nonzero(*candidate)?;
+    let base = Uint::<LIMBS>::from(256u16).rem_vartime(&modulus);
+    let mut accumulator = Uint::ZERO;
+    for &byte in coefficient.magnitude {
+        let byte = Uint::<LIMBS>::from(byte).rem_vartime(&modulus);
+        accumulator = accumulator
+            .mul_mod_vartime(&base, &modulus)
+            .add_mod(&byte, &modulus);
+    }
+    Some(if coefficient.negative {
+        negate(&accumulator, candidate)
+    } else {
+        accumulator
+    })
 }
 
-impl<const LIMBS: usize> CubicPolynomial<LIMBS> {
-    fn new(
-        candidate: &Uint<LIMBS>,
-        quadratic: Uint<LIMBS>,
-        linear: Uint<LIMBS>,
-        constant: Uint<LIMBS>,
-    ) -> Option<Self> {
-        let modulus = nonzero(*candidate)?;
-        let x_cubed = [
-            negate(&constant, candidate),
-            negate(&linear, candidate),
-            negate(&quadratic, candidate),
-        ];
-        // x⁴ ≡ (q² − l)·x² + (q·l − c)·x + q·c below the cubic.
-        let q_squared = quadratic.mul_mod_vartime(&quadratic, &modulus);
-        let x_fourth = [
-            quadratic.mul_mod_vartime(&constant, &modulus),
-            quadratic
-                .mul_mod_vartime(&linear, &modulus)
-                .sub_mod(&constant, &modulus),
-            q_squared.sub_mod(&linear, &modulus),
-        ];
-        Some(Self {
-            quadratic,
-            linear,
-            constant,
-            x_cubed,
-            x_fourth,
-        })
+const POLY_CAPACITY: usize = 2 * MAX_CLASS_NUMBER + 1;
+
+/// A dense polynomial with coefficients below the candidate; `length` counts
+/// coefficients from the constant term upward.
+#[derive(Clone, Copy)]
+struct Polynomial<const LIMBS: usize> {
+    coefficients: [Uint<LIMBS>; POLY_CAPACITY],
+    length: usize,
+}
+
+impl<const LIMBS: usize> Polynomial<LIMBS> {
+    const fn zero() -> Self {
+        Self {
+            coefficients: [Uint::ZERO; POLY_CAPACITY],
+            length: 0,
+        }
     }
 
-    fn evaluate(&self, modulus: &NonZero<Uint<LIMBS>>, x: &Uint<LIMBS>) -> Uint<LIMBS> {
-        let mut accumulator = x.add_mod(&self.quadratic, modulus);
+    fn trim(&mut self) {
+        while self.length > 0 && self.coefficients[self.length - 1] == Uint::ZERO {
+            self.length -= 1;
+        }
+    }
+}
+
+/// Evaluates a monic polynomial given its non-leading coefficients, constant
+/// term first.
+fn polynomial_evaluate<const LIMBS: usize>(
+    modulus: &NonZero<Uint<LIMBS>>,
+    non_leading: &[Uint<LIMBS>],
+    x: &Uint<LIMBS>,
+) -> Uint<LIMBS> {
+    let mut accumulator = Uint::ONE;
+    for coefficient in non_leading.iter().rev() {
         accumulator = accumulator
             .mul_mod_vartime(x, modulus)
-            .add_mod(&self.linear, modulus);
-        accumulator
-            .mul_mod_vartime(x, modulus)
-            .add_mod(&self.constant, modulus)
+            .add_mod(coefficient, modulus);
     }
-
-    fn multiply(
-        &self,
-        modulus: &NonZero<Uint<LIMBS>>,
-        left: &[Uint<LIMBS>; 3],
-        right: &[Uint<LIMBS>; 3],
-    ) -> [Uint<LIMBS>; 3] {
-        let mut raw = [Uint::ZERO; 5];
-        for (i, left_coefficient) in left.iter().enumerate() {
-            for (j, right_coefficient) in right.iter().enumerate() {
-                let product = left_coefficient.mul_mod_vartime(right_coefficient, modulus);
-                raw[i + j] = raw[i + j].add_mod(&product, modulus);
-            }
-        }
-        let mut output = [raw[0], raw[1], raw[2]];
-        for (index, coefficient) in output.iter_mut().enumerate() {
-            let cubed = raw[3].mul_mod_vartime(&self.x_cubed[index], modulus);
-            let fourth = raw[4].mul_mod_vartime(&self.x_fourth[index], modulus);
-            *coefficient = coefficient
-                .add_mod(&cubed, modulus)
-                .add_mod(&fourth, modulus);
-        }
-        output
-    }
-
-    fn power(
-        &self,
-        modulus: &NonZero<Uint<LIMBS>>,
-        base: &[Uint<LIMBS>; 3],
-        exponent: &Uint<LIMBS>,
-    ) -> [Uint<LIMBS>; 3] {
-        let mut output = [Uint::ONE, Uint::ZERO, Uint::ZERO];
-        let mut base = *base;
-        let bits = exponent.bits_vartime();
-        for index in 0..bits {
-            if exponent.bit_vartime(index) {
-                output = self.multiply(modulus, &output, &base);
-            }
-            if index + 1 < bits {
-                base = self.multiply(modulus, &base, &base);
-            }
-        }
-        output
-    }
+    accumulator
 }
 
-fn trim_length<const LIMBS: usize>(polynomial: &[Uint<LIMBS>; 4], mut length: usize) -> usize {
-    while length > 0 && polynomial[length - 1] == Uint::ZERO {
-        length -= 1;
-    }
-    length
-}
-
-fn polynomial_rem<const LIMBS: usize>(
+fn polynomial_div_rem<const LIMBS: usize>(
     modulus: &NonZero<Uint<LIMBS>>,
-    dividend: &[Uint<LIMBS>; 4],
-    dividend_length: usize,
-    divisor: &[Uint<LIMBS>; 4],
-    divisor_length: usize,
-) -> Option<([Uint<LIMBS>; 4], usize)> {
-    let divisor_degree = divisor_length - 1;
-    let lead_inverse = divisor[divisor_degree].invert_mod(modulus).into_option()?;
+    dividend: &Polynomial<LIMBS>,
+    divisor: &Polynomial<LIMBS>,
+) -> Option<(Polynomial<LIMBS>, Polynomial<LIMBS>)> {
+    let divisor_degree = divisor.length - 1;
+    let lead_inverse = divisor.coefficients[divisor_degree]
+        .invert_mod(modulus)
+        .into_option()?;
     let mut remainder = *dividend;
-    let mut length = dividend_length;
-    while length > divisor_degree {
-        let top = length - 1;
-        let coefficient = remainder[top];
+    let mut quotient = Polynomial::zero();
+    quotient.length = remainder.length.saturating_sub(divisor_degree);
+    while remainder.length > divisor_degree {
+        let top = remainder.length - 1;
+        let coefficient = remainder.coefficients[top];
         if coefficient != Uint::ZERO {
             let factor = coefficient.mul_mod_vartime(&lead_inverse, modulus);
             let shift = top - divisor_degree;
-            for (offset, divisor_coefficient) in divisor.iter().take(divisor_length).enumerate() {
-                let subtrahend = factor.mul_mod_vartime(divisor_coefficient, modulus);
-                remainder[shift + offset] = remainder[shift + offset].sub_mod(&subtrahend, modulus);
+            for offset in 0..divisor.length {
+                let subtrahend = factor.mul_mod_vartime(&divisor.coefficients[offset], modulus);
+                remainder.coefficients[shift + offset] =
+                    remainder.coefficients[shift + offset].sub_mod(&subtrahend, modulus);
             }
+            quotient.coefficients[shift] = factor;
         }
-        length -= 1;
+        remainder.coefficients[top] = Uint::ZERO;
+        remainder.length -= 1;
     }
-    Some((remainder, trim_length(&remainder, length)))
+    remainder.trim();
+    quotient.trim();
+    Some((quotient, remainder))
 }
 
 fn polynomial_gcd<const LIMBS: usize>(
     modulus: &NonZero<Uint<LIMBS>>,
-    mut left: [Uint<LIMBS>; 4],
-    mut left_length: usize,
-    mut right: [Uint<LIMBS>; 4],
-    mut right_length: usize,
-) -> Option<([Uint<LIMBS>; 4], usize)> {
-    left_length = trim_length(&left, left_length);
-    right_length = trim_length(&right, right_length);
-    while right_length > 0 {
-        let (remainder, remainder_length) =
-            polynomial_rem(modulus, &left, left_length, &right, right_length)?;
+    mut left: Polynomial<LIMBS>,
+    mut right: Polynomial<LIMBS>,
+) -> Option<Polynomial<LIMBS>> {
+    left.trim();
+    right.trim();
+    while right.length > 0 {
+        let (_, remainder) = polynomial_div_rem(modulus, &left, &right)?;
         left = right;
-        left_length = right_length;
         right = remainder;
-        right_length = remainder_length;
     }
-    Some((left, left_length))
+    Some(left)
 }
 
-/// Finds roots of a fully split monic cubic by Cantor–Zassenhaus splitting:
-/// `gcd(H, (x + r)^((n−1)/2) − 1)` isolates the roots whose shifted values
-/// are quadratic residues.
-fn cubic_roots<const LIMBS: usize, R: CryptoRng + ?Sized>(
-    candidate: &Uint<LIMBS>,
-    polynomial: &CubicPolynomial<LIMBS>,
-    rng: &mut R,
-) -> Option<[Option<Uint<LIMBS>>; 3]> {
-    let modulus = nonzero(*candidate)?;
-    let exponent = candidate.wrapping_sub(&Uint::ONE).shr_vartime(1);
-    let cubic = [
-        polynomial.constant,
-        polynomial.linear,
-        polynomial.quadratic,
-        Uint::ONE,
-    ];
-    for _ in 0..16 {
-        let shift = Uint::random_mod_vartime(rng, &modulus);
-        let base = [shift, Uint::ONE, Uint::ZERO];
-        let mut split = polynomial.power(&modulus, &base, &exponent);
-        split[0] = split[0].sub_mod(&Uint::ONE, &modulus);
-        let padded = [split[0], split[1], split[2], Uint::ZERO];
-        let (factor, factor_length) = polynomial_gcd(&modulus, cubic, 4, padded, 3)?;
-        let candidates = match factor_length {
-            2 => {
-                let inverse = factor[1].invert_mod(&modulus).into_option()?;
-                let root = negate(&factor[0], candidate).mul_mod_vartime(&inverse, &modulus);
-                // Deflate by the root: H = (x − r)(x² + p·x + q).
-                let deflated_linear = polynomial.quadratic.add_mod(&root, &modulus);
-                let deflated_constant = root
-                    .mul_mod_vartime(&deflated_linear, &modulus)
-                    .add_mod(&polynomial.linear, &modulus);
-                match quadratic_roots(candidate, &deflated_linear, &deflated_constant) {
-                    Some((second, third)) => [Some(root), Some(second), Some(third)],
-                    None => [Some(root), None, None],
-                }
-            }
-            3 => {
-                let inverse = factor[2].invert_mod(&modulus).into_option()?;
-                let monic_linear = factor[1].mul_mod_vartime(&inverse, &modulus);
-                let monic_constant = factor[0].mul_mod_vartime(&inverse, &modulus);
-                let Some((first, second)) =
-                    quadratic_roots(candidate, &monic_linear, &monic_constant)
-                else {
-                    continue;
-                };
-                // The root sum is −quadratic, which yields the third root.
-                let sum = first.add_mod(&second, &modulus);
-                let third = negate(&polynomial.quadratic, candidate).sub_mod(&sum, &modulus);
-                [Some(first), Some(second), Some(third)]
-            }
-            _ => continue,
-        };
-        let mut verified = [None; 3];
-        let mut count = 0;
-        for root in candidates.into_iter().flatten() {
-            if polynomial.evaluate(&modulus, &root) == Uint::ZERO {
-                verified[count] = Some(root);
-                count += 1;
-            }
-        }
-        if count > 0 {
-            return Some(verified);
+fn polynomial_mulmod<const LIMBS: usize>(
+    modulus: &NonZero<Uint<LIMBS>>,
+    left: &Polynomial<LIMBS>,
+    right: &Polynomial<LIMBS>,
+    reducer: &Polynomial<LIMBS>,
+) -> Option<Polynomial<LIMBS>> {
+    if left.length == 0 || right.length == 0 {
+        return Some(Polynomial::zero());
+    }
+    if left.length + right.length - 1 > POLY_CAPACITY {
+        return None;
+    }
+    let mut product = Polynomial::zero();
+    product.length = left.length + right.length - 1;
+    for i in 0..left.length {
+        for j in 0..right.length {
+            let term = left.coefficients[i].mul_mod_vartime(&right.coefficients[j], modulus);
+            product.coefficients[i + j] = product.coefficients[i + j].add_mod(&term, modulus);
         }
     }
-    None
+    Some(polynomial_div_rem(modulus, &product, reducer)?.1)
+}
+
+fn polynomial_powmod<const LIMBS: usize>(
+    modulus: &NonZero<Uint<LIMBS>>,
+    base: &Polynomial<LIMBS>,
+    exponent: &Uint<LIMBS>,
+    reducer: &Polynomial<LIMBS>,
+) -> Option<Polynomial<LIMBS>> {
+    let mut output = Polynomial::zero();
+    output.coefficients[0] = Uint::ONE;
+    output.length = 1;
+    let mut base = *base;
+    let bits = exponent.bits_vartime();
+    for index in 0..bits {
+        if exponent.bit_vartime(index) {
+            output = polynomial_mulmod(modulus, &output, &base, reducer)?;
+        }
+        if index + 1 < bits {
+            base = polynomial_mulmod(modulus, &base, &base, reducer)?;
+        }
+    }
+    Some(output)
+}
+
+/// Collects roots of a fully split monic polynomial by recursive
+/// Cantor–Zassenhaus splitting: `gcd(f, (x + r)^((n−1)/2) − 1)` separates
+/// the roots by the quadratic character of their shifts.
+fn polynomial_roots<const LIMBS: usize, R: CryptoRng + ?Sized>(
+    candidate: &Uint<LIMBS>,
+    mut polynomial: Polynomial<LIMBS>,
+    rng: &mut R,
+    attempts: &mut u32,
+    roots: &mut RootSet<LIMBS>,
+) -> Option<()> {
+    let modulus = nonzero(*candidate)?;
+    polynomial.trim();
+    if polynomial.length <= 1 {
+        return Some(());
+    }
+    if polynomial.length == 2 {
+        let inverse = polynomial.coefficients[1]
+            .invert_mod(&modulus)
+            .into_option()?;
+        let root =
+            negate(&polynomial.coefficients[0], candidate).mul_mod_vartime(&inverse, &modulus);
+        roots.push(root);
+        return Some(());
+    }
+    if polynomial.length == 3 {
+        let inverse = polynomial.coefficients[2]
+            .invert_mod(&modulus)
+            .into_option()?;
+        let linear = polynomial.coefficients[1].mul_mod_vartime(&inverse, &modulus);
+        let constant = polynomial.coefficients[0].mul_mod_vartime(&inverse, &modulus);
+        if let Some((first, second)) = quadratic_roots(candidate, &linear, &constant) {
+            roots.push(first);
+            roots.push(second);
+        }
+        return Some(());
+    }
+    let exponent = candidate.wrapping_sub(&Uint::ONE).shr_vartime(1);
+    while *attempts > 0 {
+        *attempts -= 1;
+        let shift = Uint::random_mod_vartime(rng, &modulus);
+        let mut base = Polynomial::zero();
+        base.coefficients[0] = shift;
+        base.coefficients[1] = Uint::ONE;
+        base.length = 2;
+        let mut split = polynomial_powmod(&modulus, &base, &exponent, &polynomial)?;
+        if split.length == 0 {
+            split.length = 1;
+        }
+        split.coefficients[0] = split.coefficients[0].sub_mod(&Uint::ONE, &modulus);
+        let factor = polynomial_gcd(&modulus, polynomial, split)?;
+        if factor.length <= 1 || factor.length >= polynomial.length {
+            continue;
+        }
+        let (quotient, _) = polynomial_div_rem(&modulus, &polynomial, &factor)?;
+        polynomial_roots(candidate, factor, rng, attempts, roots)?;
+        polynomial_roots(candidate, quotient, rng, attempts, roots)?;
+        return Some(());
+    }
+    Some(())
+}
+
+/// A fixed-capacity collection of candidate polynomial roots.
+struct RootSet<const LIMBS: usize> {
+    roots: [Option<Uint<LIMBS>>; MAX_CLASS_NUMBER],
+    count: usize,
+}
+
+impl<const LIMBS: usize> RootSet<LIMBS> {
+    const fn new() -> Self {
+        Self {
+            roots: [None; MAX_CLASS_NUMBER],
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, root: Uint<LIMBS>) {
+        if self.count < MAX_CLASS_NUMBER {
+            self.roots[self.count] = Some(root);
+            self.count += 1;
+        }
+    }
 }
 
 fn j_invariants<const LIMBS: usize, R: CryptoRng + ?Sized>(
     candidate: &Uint<LIMBS>,
     polynomial: ClassPolynomial,
     rng: &mut R,
-) -> Option<[Option<Uint<LIMBS>>; 3]> {
+) -> Option<[Option<Uint<LIMBS>>; MAX_CLASS_NUMBER]> {
+    let mut output = [None; MAX_CLASS_NUMBER];
     match polynomial {
-        ClassPolynomial::Linear(root) => Some([Some(mod_signed(root, candidate)?), None, None]),
+        ClassPolynomial::Linear(root) => {
+            output[0] = Some(mod_signed(root, candidate)?);
+            Some(output)
+        }
         ClassPolynomial::Quadratic { constant, linear } => {
             let linear_mod = mod_signed(linear, candidate)?;
             let constant_mod = mod_signed(constant, candidate)?;
             let (first, second) = quadratic_roots(candidate, &linear_mod, &constant_mod)?;
-            Some([Some(first), Some(second), None])
+            output[0] = Some(first);
+            output[1] = Some(second);
+            Some(output)
         }
-        ClassPolynomial::Cubic {
-            constant,
-            linear,
-            quadratic,
-        } => {
-            let polynomial = CubicPolynomial::new(
-                candidate,
-                mod_signed(quadratic, candidate)?,
-                mod_signed(linear, candidate)?,
-                mod_signed(constant, candidate)?,
-            )?;
-            cubic_roots(candidate, &polynomial, rng)
+        ClassPolynomial::General(coefficients) => {
+            if coefficients.len() >= POLY_CAPACITY {
+                return None;
+            }
+            let modulus = nonzero(*candidate)?;
+            let mut reduced = Polynomial::zero();
+            for (index, coefficient) in coefficients.iter().enumerate() {
+                reduced.coefficients[index] = reduce_signed_magnitude(coefficient, candidate)?;
+            }
+            reduced.coefficients[coefficients.len()] = Uint::ONE;
+            reduced.length = coefficients.len() + 1;
+            let mut attempts = 16 + 8 * coefficients.len() as u32;
+            let mut roots = RootSet::new();
+            polynomial_roots(candidate, reduced, rng, &mut attempts, &mut roots)?;
+            let non_leading = &reduced.coefficients[..coefficients.len()];
+            let mut verified = 0usize;
+            for root in roots.roots.into_iter().flatten() {
+                if polynomial_evaluate(&modulus, non_leading, &root) == Uint::ZERO {
+                    output[verified] = Some(root);
+                    verified += 1;
+                }
+            }
+            (verified > 0).then_some(output)
         }
     }
 }
@@ -1713,6 +1826,7 @@ mod tests {
     fn default_options_stop_at_class_number_two() {
         assert_eq!(ProverOptions::default().max_class_number, 2);
         assert_eq!(ProverOptions::default().ecm_rounds, 0);
+        assert_eq!(ProverOptions::default().search_budget, 1024);
     }
 
     #[test]
@@ -1738,41 +1852,22 @@ mod tests {
     }
 
     #[test]
-    fn cubic_class_polynomial_splits_for_represented_primes() {
-        use crate::cm::{ClassPolynomial, DISCRIMINANTS};
+    fn class_polynomials_split_for_represented_primes() {
+        use crate::cm::DISCRIMINANTS;
 
-        let cubic_entry = DISCRIMINANTS
+        let entry = DISCRIMINANTS
             .iter()
             .find(|discriminant| discriminant.value == -23)
             .expect("table contains -23");
-        let ClassPolynomial::Cubic {
-            constant,
-            linear,
-            quadratic,
-        } = cubic_entry.polynomial
-        else {
-            panic!("-23 should be cubic");
-        };
+        assert_eq!(entry.polynomial.class_number(), 3);
 
         let mut rng = StdRng::seed_from_u64(5);
         // 4·59 = 12² + 23·2² and 4·101 = 6² + 23·4², so H₋₂₃ splits
         // completely modulo both primes.
         for prime in [59u32, 101] {
             let candidate = U256::from(prime);
-            let modulus = nonzero(candidate).unwrap();
-            let polynomial = CubicPolynomial::new(
-                &candidate,
-                mod_signed(quadratic, &candidate).unwrap(),
-                mod_signed(linear, &candidate).unwrap(),
-                mod_signed(constant, &candidate).unwrap(),
-            )
-            .unwrap();
-            let roots = cubic_roots(&candidate, &polynomial, &mut rng).unwrap();
-            let mut count = 0;
-            for root in roots.into_iter().flatten() {
-                assert_eq!(polynomial.evaluate(&modulus, &root), U256::ZERO);
-                count += 1;
-            }
+            let roots = j_invariants(&candidate, entry.polynomial, &mut rng).unwrap();
+            let count = roots.into_iter().flatten().count();
             assert_eq!(count, 3, "prime {prime} should split completely");
         }
     }

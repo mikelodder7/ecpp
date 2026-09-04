@@ -1,0 +1,9 @@
+[package]
+name = "hilbert-table"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Regenerates src/cm_generated.rs: cargo run --release > ../../src/cm_generated.rs"
+
+[dependencies]
+rug = { version = "1.28", features = ["integer", "float", "complex"] }

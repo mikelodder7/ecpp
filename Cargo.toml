@@ -10,6 +10,7 @@ license = "Apache-2.0 OR MIT"
 keywords = ["primality", "ecpp", "elliptic-curve", "bigint", "cryptography"]
 categories = ["cryptography", "algorithms", "mathematics"]
 readme = "README.md"
+exclude = ["tools/", "crypto-bigint-jacobi-report.md", "_typos.toml"]
 
 [features]
 default = ["std", "getrandom", "num-bigint", "crypto-bigint"]

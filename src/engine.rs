@@ -5,7 +5,7 @@ use core::cmp::Ordering;
 use rand_core::CryptoRng;
 
 use crate::arithmetic::{ArithmeticBackend, cmp_u64, from_u64, from_u128, to_u64};
-use crate::cm::{ClassPolynomial, DISCRIMINANTS};
+use crate::cm::{ClassPolynomial, DISCRIMINANTS, SignedMagnitude};
 use crate::{Error, PrimalityProof, ProofNode, Result};
 
 fn zero<B: ArithmeticBackend>() -> Result<B> {
@@ -214,89 +214,39 @@ fn quadratic_roots<B: ArithmeticBackend>(
     Ok(Some((first, second)))
 }
 
-/// A monic cubic `x³ + quadratic·x² + linear·x + constant` with coefficients
-/// reduced modulo the candidate, plus the precomputed reductions of `x³` and
-/// `x⁴` used to multiply residue polynomials of degree below three.
-struct CubicPolynomial<B: ArithmeticBackend> {
-    quadratic: B,
-    linear: B,
-    constant: B,
-    x_cubed: [B; 3],
-    x_fourth: [B; 3],
+/// Reduces a stored signed big-endian constant modulo the candidate by
+/// Horner's rule, so backends with fixed working precision never decode the
+/// full magnitude.
+fn reduce_signed_magnitude<B: ArithmeticBackend>(
+    coefficient: &SignedMagnitude,
+    modulus: &B,
+) -> Result<B> {
+    let base = from_u64::<B>(256)?;
+    let mut accumulator = zero::<B>()?;
+    for &byte in coefficient.magnitude {
+        accumulator = ((modular_mul::<B>(&accumulator, &base, modulus)?
+            + &from_u64::<B>(u64::from(byte))?)?
+            % modulus)?;
+    }
+    if coefficient.negative {
+        negate_mod::<B>(&accumulator, modulus)
+    } else {
+        Ok(accumulator)
+    }
 }
 
-impl<B: ArithmeticBackend> CubicPolynomial<B> {
-    fn new(candidate: &B, quadratic: B, linear: B, constant: B) -> Result<Self> {
-        let x_cubed = [
-            negate_mod::<B>(&constant, candidate)?,
-            negate_mod::<B>(&linear, candidate)?,
-            negate_mod::<B>(&quadratic, candidate)?,
-        ];
-        // x⁴ ≡ (q² − l)·x² + (q·l − c)·x + q·c below the cubic.
-        let q_squared = modular_mul::<B>(&quadratic, &quadratic, candidate)?;
-        let x_fourth = [
-            modular_mul::<B>(&quadratic, &constant, candidate)?,
-            modular_sub::<B>(
-                &modular_mul::<B>(&quadratic, &linear, candidate)?,
-                &constant,
-                candidate,
-            )?,
-            modular_sub::<B>(&q_squared, &linear, candidate)?,
-        ];
-        Ok(Self {
-            quadratic,
-            linear,
-            constant,
-            x_cubed,
-            x_fourth,
-        })
+/// Evaluates a monic polynomial given its non-leading coefficients, constant
+/// term first.
+fn polynomial_evaluate<B: ArithmeticBackend>(
+    candidate: &B,
+    coefficients: &[B],
+    x: &B,
+) -> Result<B> {
+    let mut accumulator = one::<B>()?;
+    for coefficient in coefficients.iter().rev() {
+        accumulator = ((modular_mul::<B>(&accumulator, x, candidate)? + coefficient)? % candidate)?;
     }
-
-    fn evaluate(&self, candidate: &B, x: &B) -> Result<B> {
-        let mut accumulator = ((x.clone() + &self.quadratic)? % candidate)?;
-        accumulator =
-            ((modular_mul::<B>(&accumulator, x, candidate)? + &self.linear)? % candidate)?;
-        (modular_mul::<B>(&accumulator, x, candidate)? + &self.constant)? % candidate
-    }
-
-    fn multiply(&self, candidate: &B, left: &[B; 3], right: &[B; 3]) -> Result<[B; 3]> {
-        let mut raw = [
-            zero::<B>()?,
-            zero::<B>()?,
-            zero::<B>()?,
-            zero::<B>()?,
-            zero::<B>()?,
-        ];
-        for (i, left_coefficient) in left.iter().enumerate() {
-            for (j, right_coefficient) in right.iter().enumerate() {
-                let product = modular_mul::<B>(left_coefficient, right_coefficient, candidate)?;
-                raw[i + j] = ((raw[i + j].clone() + &product)? % candidate)?;
-            }
-        }
-        let [d0, d1, d2, d3, d4] = raw;
-        let mut output = [d0, d1, d2];
-        for (index, coefficient) in output.iter_mut().enumerate() {
-            let cubed = modular_mul::<B>(&d3, &self.x_cubed[index], candidate)?;
-            let fourth = modular_mul::<B>(&d4, &self.x_fourth[index], candidate)?;
-            *coefficient = (((coefficient.clone() + &cubed)? + &fourth)? % candidate)?;
-        }
-        Ok(output)
-    }
-
-    fn power(&self, candidate: &B, base: &[B; 3], exponent: &B) -> Result<[B; 3]> {
-        let mut output = [one::<B>()?, zero::<B>()?, zero::<B>()?];
-        let mut base = base.clone();
-        let bits = exponent.bit_length();
-        for index in 0..bits {
-            if exponent.bit(index) {
-                output = self.multiply(candidate, &output, &base)?;
-            }
-            if index + 1 < bits {
-                base = self.multiply(candidate, &base, &base)?;
-            }
-        }
-        Ok(output)
-    }
+    Ok(accumulator)
 }
 
 fn trim_polynomial<B: ArithmeticBackend>(polynomial: &mut Vec<B>) {
@@ -308,14 +258,15 @@ fn trim_polynomial<B: ArithmeticBackend>(polynomial: &mut Vec<B>) {
     }
 }
 
-fn polynomial_rem<B: ArithmeticBackend>(
+fn polynomial_div_rem<B: ArithmeticBackend>(
     candidate: &B,
     dividend: &[B],
     divisor: &[B],
-) -> Result<Vec<B>> {
+) -> Result<(Vec<B>, Vec<B>)> {
     let divisor_degree = divisor.len() - 1;
     let lead_inverse = divisor[divisor_degree].modular_inverse(candidate)?;
     let mut remainder = dividend.to_vec();
+    let mut quotient = vec![zero::<B>()?; remainder.len().saturating_sub(divisor_degree)];
     while remainder.len() > divisor_degree {
         let top = remainder.len() - 1;
         let coefficient = remainder[top].clone();
@@ -327,11 +278,13 @@ fn polynomial_rem<B: ArithmeticBackend>(
                 remainder[shift + offset] =
                     modular_sub::<B>(&remainder[shift + offset], &subtrahend, candidate)?;
             }
+            quotient[shift] = factor;
         }
         remainder.pop();
     }
     trim_polynomial::<B>(&mut remainder);
-    Ok(remainder)
+    trim_polynomial::<B>(&mut quotient);
+    Ok((quotient, remainder))
 }
 
 fn polynomial_gcd<B: ArithmeticBackend>(
@@ -342,87 +295,106 @@ fn polynomial_gcd<B: ArithmeticBackend>(
     trim_polynomial::<B>(&mut left);
     trim_polynomial::<B>(&mut right);
     while !right.is_empty() {
-        let remainder = polynomial_rem::<B>(candidate, &left, &right)?;
+        let (_, remainder) = polynomial_div_rem::<B>(candidate, &left, &right)?;
         left = right;
         right = remainder;
     }
     Ok(left)
 }
 
-/// Finds roots of a fully split monic cubic by Cantor–Zassenhaus splitting:
-/// `gcd(H, (x + r)^((n−1)/2) − 1)` isolates the roots whose shifted values
-/// are quadratic residues.
-fn cubic_roots<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
+fn polynomial_mulmod<B: ArithmeticBackend>(
     candidate: &B,
-    polynomial: &CubicPolynomial<B>,
-    rng: &mut R,
-) -> Result<Option<Vec<B>>> {
-    let one = one::<B>()?;
-    let exponent = ((candidate.clone() - &one)? >> 1)?;
-    let cubic = vec![
-        polynomial.constant.clone(),
-        polynomial.linear.clone(),
-        polynomial.quadratic.clone(),
-        one.clone(),
-    ];
-    for _ in 0..16 {
-        let shift = random_below::<B, R>(candidate, rng)?;
-        let base = [shift, one.clone(), zero::<B>()?];
-        let mut split = polynomial.power(candidate, &base, &exponent)?;
-        split[0] = modular_sub::<B>(&split[0], &one, candidate)?;
-        let factor = polynomial_gcd::<B>(candidate, cubic.clone(), split.to_vec())?;
-        let candidates = match factor.len() {
-            2 => {
-                let root = modular_mul::<B>(
-                    &negate_mod::<B>(&factor[0], candidate)?,
-                    &factor[1].modular_inverse(candidate)?,
-                    candidate,
-                )?;
-                // Deflate by the root: H = (x − r)(x² + p·x + q).
-                let deflated_linear = ((polynomial.quadratic.clone() + &root)? % candidate)?;
-                let deflated_constant = ((modular_mul::<B>(&root, &deflated_linear, candidate)?
-                    + &polynomial.linear)?
-                    % candidate)?;
-                let mut roots = vec![root];
-                if let Some((second, third)) =
-                    quadratic_roots::<B>(candidate, &deflated_linear, &deflated_constant)?
-                {
-                    roots.push(second);
-                    roots.push(third);
-                }
-                roots
-            }
-            3 => {
-                let inverse = factor[2].modular_inverse(candidate)?;
-                let monic_linear = modular_mul::<B>(&factor[1], &inverse, candidate)?;
-                let monic_constant = modular_mul::<B>(&factor[0], &inverse, candidate)?;
-                let Some((first, second)) =
-                    quadratic_roots::<B>(candidate, &monic_linear, &monic_constant)?
-                else {
-                    continue;
-                };
-                // The root sum is −quadratic, which yields the third root.
-                let sum = ((first.clone() + &second)? % candidate)?;
-                let third = modular_sub::<B>(
-                    &negate_mod::<B>(&polynomial.quadratic, candidate)?,
-                    &sum,
-                    candidate,
-                )?;
-                vec![first, second, third]
-            }
-            _ => continue,
-        };
-        let mut roots = Vec::with_capacity(candidates.len());
-        for root in candidates {
-            if polynomial.evaluate(candidate, &root)?.is_zero() {
-                roots.push(root);
-            }
-        }
-        if !roots.is_empty() {
-            return Ok(Some(roots));
+    left: &[B],
+    right: &[B],
+    modulus_polynomial: &[B],
+) -> Result<Vec<B>> {
+    if left.is_empty() || right.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut product = vec![zero::<B>()?; left.len() + right.len() - 1];
+    for (i, left_coefficient) in left.iter().enumerate() {
+        for (j, right_coefficient) in right.iter().enumerate() {
+            let term = modular_mul::<B>(left_coefficient, right_coefficient, candidate)?;
+            product[i + j] = ((product[i + j].clone() + &term)? % candidate)?;
         }
     }
-    Ok(None)
+    Ok(polynomial_div_rem::<B>(candidate, &product, modulus_polynomial)?.1)
+}
+
+fn polynomial_powmod<B: ArithmeticBackend>(
+    candidate: &B,
+    base: &[B],
+    exponent: &B,
+    modulus_polynomial: &[B],
+) -> Result<Vec<B>> {
+    let mut output = vec![one::<B>()?];
+    let mut base = base.to_vec();
+    let bits = exponent.bit_length();
+    for index in 0..bits {
+        if exponent.bit(index) {
+            output = polynomial_mulmod::<B>(candidate, &output, &base, modulus_polynomial)?;
+        }
+        if index + 1 < bits {
+            base = polynomial_mulmod::<B>(candidate, &base, &base, modulus_polynomial)?;
+        }
+    }
+    Ok(output)
+}
+
+/// Collects roots of a fully split monic polynomial by recursive
+/// Cantor–Zassenhaus splitting: `gcd(f, (x + r)^((n−1)/2) − 1)` separates
+/// the roots by the quadratic character of their shifts.
+fn polynomial_roots<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
+    candidate: &B,
+    mut polynomial: Vec<B>,
+    rng: &mut R,
+    attempts: &mut u32,
+    roots: &mut Vec<B>,
+) -> Result<()> {
+    trim_polynomial::<B>(&mut polynomial);
+    if polynomial.len() <= 1 {
+        return Ok(());
+    }
+    if polynomial.len() == 2 {
+        let root = modular_mul::<B>(
+            &negate_mod::<B>(&polynomial[0], candidate)?,
+            &polynomial[1].modular_inverse(candidate)?,
+            candidate,
+        )?;
+        roots.push(root);
+        return Ok(());
+    }
+    if polynomial.len() == 3 {
+        let inverse = polynomial[2].modular_inverse(candidate)?;
+        let linear = modular_mul::<B>(&polynomial[1], &inverse, candidate)?;
+        let constant = modular_mul::<B>(&polynomial[0], &inverse, candidate)?;
+        if let Some((first, second)) = quadratic_roots::<B>(candidate, &linear, &constant)? {
+            roots.push(first);
+            roots.push(second);
+        }
+        return Ok(());
+    }
+    let one_value = one::<B>()?;
+    let exponent = ((candidate.clone() - &one_value)? >> 1)?;
+    while *attempts > 0 {
+        *attempts -= 1;
+        let shift = random_below::<B, R>(candidate, rng)?;
+        let base = vec![shift, one_value.clone()];
+        let mut split = polynomial_powmod::<B>(candidate, &base, &exponent, &polynomial)?;
+        if split.is_empty() {
+            split.push(zero::<B>()?);
+        }
+        split[0] = modular_sub::<B>(&split[0], &one_value, candidate)?;
+        let factor = polynomial_gcd::<B>(candidate, polynomial.clone(), split)?;
+        if factor.len() <= 1 || factor.len() >= polynomial.len() {
+            continue;
+        }
+        let (quotient, _) = polynomial_div_rem::<B>(candidate, &polynomial, &factor)?;
+        polynomial_roots::<B, R>(candidate, factor, rng, attempts, roots)?;
+        polynomial_roots::<B, R>(candidate, quotient, rng, attempts, roots)?;
+        return Ok(());
+    }
+    Ok(())
 }
 
 fn j_invariants<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
@@ -438,18 +410,23 @@ fn j_invariants<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
             Ok(quadratic_roots::<B>(candidate, &linear_mod, &constant_mod)?
                 .map(|(first, second)| vec![first, second]))
         }
-        ClassPolynomial::Cubic {
-            constant,
-            linear,
-            quadratic,
-        } => {
-            let polynomial = CubicPolynomial::<B>::new(
-                candidate,
-                modular_signed::<B>(quadratic, candidate)?,
-                modular_signed::<B>(linear, candidate)?,
-                modular_signed::<B>(constant, candidate)?,
-            )?;
-            cubic_roots::<B, R>(candidate, &polynomial, rng)
+        ClassPolynomial::General(coefficients) => {
+            let mut reduced = Vec::with_capacity(coefficients.len() + 1);
+            for coefficient in coefficients {
+                reduced.push(reduce_signed_magnitude::<B>(coefficient, candidate)?);
+            }
+            let non_leading = reduced.clone();
+            reduced.push(one::<B>()?);
+            let mut attempts = 16 + 8 * coefficients.len() as u32;
+            let mut roots = Vec::new();
+            polynomial_roots::<B, R>(candidate, reduced, rng, &mut attempts, &mut roots)?;
+            let mut verified = Vec::with_capacity(roots.len());
+            for root in roots {
+                if polynomial_evaluate::<B>(candidate, &non_leading, &root)?.is_zero() {
+                    verified.push(root);
+                }
+            }
+            Ok((!verified.is_empty()).then_some(verified))
         }
     }
 }
@@ -606,15 +583,18 @@ pub struct ProverOptions {
     pub point_attempts: u32,
     /// The maximum number of ECPP reductions in one certificate.
     pub max_depth: usize,
-    /// The largest CM class number searched, between one and three. Larger
-    /// class numbers widen the search at the cost of polynomial root
-    /// splitting work per level.
+    /// The largest CM class number searched, up to eight. Larger class
+    /// numbers widen the search at the cost of polynomial root splitting
+    /// work per level.
     pub max_class_number: u8,
     /// The number of ECM escalation rounds tried, up to three, when Pollard
     /// rho fails to split a curve-order cofactor of at least 384 bits. Each
     /// round raises the stage-one bound and curve count, extending the
     /// reachable factor range at growing cost. Zero disables ECM.
     pub ecm_rounds: u8,
+    /// The total number of curve orders the backtracking search may attempt
+    /// across every level and retry before reporting exhaustion.
+    pub search_budget: u32,
 }
 
 impl Default for ProverOptions {
@@ -622,9 +602,10 @@ impl Default for ProverOptions {
         Self {
             trial_division_limit: 10_000,
             point_attempts: 128,
-            max_depth: 64,
-            max_class_number: 3,
+            max_depth: 128,
+            max_class_number: 8,
             ecm_rounds: 1,
+            search_budget: 8192,
         }
     }
 }
@@ -652,21 +633,17 @@ pub(crate) fn prove<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
     }
 
     let mut nodes = Vec::new();
-    let mut current = candidate;
-    for _ in 0..options.max_depth {
-        if let Some(small) = to_u64::<B>(&current) {
-            if !is_prime_u64(small) {
-                return Err(Error::Composite);
-            }
-            nodes.push(ProofNode::SmallPrime(small));
-            return Ok(PrimalityProof { nodes });
-        }
-        let step = find_step::<B, R>(&current, rng, &primes, options)?;
-        current = step.q.clone();
-        nodes.push(ProofNode::EllipticCurve(encode_step::<B>(&step)?));
+    let mut context = SearchContext::<R> {
+        rng,
+        primes: &primes,
+        options,
+        budget: options.search_budget,
+    };
+    if descend::<B, R>(&candidate, &mut context, options.max_depth, &mut nodes)? {
+        return Ok(PrimalityProof { nodes });
     }
     Err(Error::SearchExhausted {
-        candidate: crate::Natural::from_be_bytes(&current.to_be_bytes()),
+        candidate: crate::Natural::from_be_bytes(&candidate.to_be_bytes()),
     })
 }
 
@@ -694,119 +671,188 @@ fn encode_step<B: ArithmeticBackend>(step: &WorkingStep<B>) -> Result<crate::Ecp
     })
 }
 
-struct StepSearch<'a, B: ArithmeticBackend, R: ?Sized> {
-    candidate: &'a B,
+struct SearchContext<'a, R: ?Sized> {
     rng: &'a mut R,
     primes: &'a [u32],
-    point_attempts: u32,
-    ecm_rounds: u8,
+    options: ProverOptions,
+    budget: u32,
 }
 
-fn find_step<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
-    candidate: &B,
-    rng: &mut R,
-    primes: &[u32],
-    options: ProverOptions,
-) -> Result<WorkingStep<B>> {
-    let mut search = StepSearch::<B, R> {
-        candidate,
-        rng,
-        primes,
-        point_attempts: options.point_attempts,
-        ecm_rounds: options.ecm_rounds,
-    };
-    let order = add_u64::<B>(candidate, 1)?;
-    // A value is 3 modulo 4 exactly when its low two bits are set.
-    if candidate.bit(0) && candidate.bit(1) {
-        let curve = AffineCurve::<B> {
-            a: one::<B>()?,
-            b: zero::<B>()?,
-        };
-        if let Some(step) = try_order::<B, R>(&mut search, &order, &curve, None)? {
-            return Ok(step);
-        }
-    }
-    let modulo_three = (candidate.clone() % &from_u64::<B>(3)?)?;
-    if cmp_u64::<B>(&modulo_three, 2)? == Ordering::Equal {
-        let curve = AffineCurve::<B> {
-            a: zero::<B>()?,
-            b: one::<B>()?,
-        };
-        if let Some(step) = try_order::<B, R>(&mut search, &order, &curve, None)? {
-            return Ok(step);
-        }
-    }
+/// Full-table sweeps allowed per level before backtracking further up; every
+/// sweep after the first re-rolls the randomized factoring and point search.
+const MAX_LEVEL_SWEEPS: u32 = 4;
 
-    for discriminant in DISCRIMINANTS {
-        if discriminant.polynomial.class_number() > options.max_class_number {
-            continue;
+enum StepOutcome {
+    /// The step and everything below it verified; the chain is complete.
+    Proved,
+    /// The order was consumed without completing a chain.
+    Failed,
+    /// No order attempt was possible (budget exhausted).
+    Exhausted,
+}
+
+/// Depth-first ECPP descent with backtracking: each level tries every curve
+/// order the CM search yields, and a failure below abandons only that branch
+/// rather than the whole proof.
+fn descend<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
+    candidate: &B,
+    context: &mut SearchContext<'_, R>,
+    depth_remaining: usize,
+    nodes: &mut Vec<ProofNode>,
+) -> Result<bool> {
+    if let Some(small) = to_u64::<B>(candidate) {
+        if is_prime_u64(small) {
+            nodes.push(ProofNode::SmallPrime(small));
+            return Ok(true);
         }
-        let Some((trace, _)) = cornacchia::<B>(candidate, discriminant.value)? else {
-            continue;
-        };
-        let Some(invariants) =
-            j_invariants::<B, R>(candidate, discriminant.polynomial, &mut *search.rng)?
-        else {
-            continue;
-        };
-        for invariant in invariants {
-            let base = curve_from_j::<B>(candidate, &invariant)?;
-            let twist = quadratic_twist::<B>(candidate, &base)?;
-            let lower = (order.clone() - &trace)?;
-            let upper = (order.clone() + &trace)?;
-            for curve_order in [lower, upper] {
-                if let Some(step) =
-                    try_order::<B, R>(&mut search, &curve_order, &base, Some(&twist))?
-                {
-                    return Ok(step);
+        return Ok(false);
+    }
+    if depth_remaining == 0 {
+        return Ok(false);
+    }
+    let order = add_u64::<B>(candidate, 1)?;
+    for _ in 0..MAX_LEVEL_SWEEPS {
+        let mut orders_tried = false;
+        // A value is 3 modulo 4 exactly when its low two bits are set.
+        if candidate.bit(0) && candidate.bit(1) {
+            let curve = AffineCurve::<B> {
+                a: one::<B>()?,
+                b: zero::<B>()?,
+            };
+            match attempt_step::<B, R>(
+                candidate,
+                &order,
+                &curve,
+                None,
+                context,
+                depth_remaining,
+                nodes,
+            )? {
+                StepOutcome::Proved => return Ok(true),
+                StepOutcome::Failed => orders_tried = true,
+                StepOutcome::Exhausted => return Ok(false),
+            }
+        }
+        let modulo_three = (candidate.clone() % &from_u64::<B>(3)?)?;
+        if cmp_u64::<B>(&modulo_three, 2)? == Ordering::Equal {
+            let curve = AffineCurve::<B> {
+                a: zero::<B>()?,
+                b: one::<B>()?,
+            };
+            match attempt_step::<B, R>(
+                candidate,
+                &order,
+                &curve,
+                None,
+                context,
+                depth_remaining,
+                nodes,
+            )? {
+                StepOutcome::Proved => return Ok(true),
+                StepOutcome::Failed => orders_tried = true,
+                StepOutcome::Exhausted => return Ok(false),
+            }
+        }
+
+        for discriminant in DISCRIMINANTS {
+            if discriminant.polynomial.class_number() > context.options.max_class_number {
+                continue;
+            }
+            if context.budget == 0 {
+                return Ok(false);
+            }
+            let Some((trace, _)) = cornacchia::<B>(candidate, discriminant.value)? else {
+                continue;
+            };
+            let Some(invariants) =
+                j_invariants::<B, R>(candidate, discriminant.polynomial, &mut *context.rng)?
+            else {
+                continue;
+            };
+            for invariant in invariants {
+                let base = curve_from_j::<B>(candidate, &invariant)?;
+                let twist = quadratic_twist::<B>(candidate, &base)?;
+                let lower = (order.clone() - &trace)?;
+                let upper = (order.clone() + &trace)?;
+                for curve_order in [lower, upper] {
+                    match attempt_step::<B, R>(
+                        candidate,
+                        &curve_order,
+                        &base,
+                        Some(&twist),
+                        context,
+                        depth_remaining,
+                        nodes,
+                    )? {
+                        StepOutcome::Proved => return Ok(true),
+                        StepOutcome::Failed => orders_tried = true,
+                        StepOutcome::Exhausted => return Ok(false),
+                    }
                 }
             }
         }
+        if !orders_tried {
+            return Ok(false);
+        }
     }
-    Err(Error::SearchExhausted {
-        candidate: crate::Natural::from_be_bytes(&candidate.to_be_bytes()),
-    })
+    Ok(false)
 }
 
-fn try_order<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
-    search: &mut StepSearch<'_, B, R>,
+/// Attempts one candidate curve order: split off a certifying prime, find a
+/// point, then recurse; on failure below, pop the step and report so the
+/// caller can try the next order.
+fn attempt_step<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
+    candidate: &B,
     order: &B,
     curve: &AffineCurve<B>,
     twist: Option<&AffineCurve<B>>,
-) -> Result<Option<WorkingStep<B>>> {
+    context: &mut SearchContext<'_, R>,
+    depth_remaining: usize,
+    nodes: &mut Vec<ProofNode>,
+) -> Result<StepOutcome> {
+    if context.budget == 0 {
+        return Ok(StepOutcome::Exhausted);
+    }
+    context.budget -= 1;
     let Some(q) = split_order::<B, R>(
-        search.candidate,
+        candidate,
         order,
-        search.primes,
-        search.ecm_rounds,
-        search.rng,
+        context.primes,
+        context.options.ecm_rounds,
+        context.rng,
     )?
     else {
-        return Ok(None);
+        return Ok(StepOutcome::Failed);
     };
     let cofactor = (order.clone() / &q)?;
     for candidate_curve in core::iter::once(curve).chain(twist) {
         if let Some(point) = find_point_of_order::<B, R>(
-            search.candidate,
+            candidate,
             candidate_curve,
             order,
             &q,
-            search.rng,
-            search.point_attempts,
+            context.rng,
+            context.options.point_attempts,
         )? {
-            return Ok(Some(WorkingStep {
-                n: search.candidate.clone(),
+            let step = WorkingStep {
+                n: candidate.clone(),
                 curve: AffineCurve {
                     a: candidate_curve.a.clone(),
                     b: candidate_curve.b.clone(),
                 },
                 point,
                 cofactor,
-                q,
-            }));
+                q: q.clone(),
+            };
+            nodes.push(ProofNode::EllipticCurve(encode_step::<B>(&step)?));
+            if descend::<B, R>(&q, context, depth_remaining - 1, nodes)? {
+                return Ok(StepOutcome::Proved);
+            }
+            nodes.pop();
+            return Ok(StepOutcome::Failed);
         }
     }
-    Ok(None)
+    Ok(StepOutcome::Failed)
 }
 
 fn split_order<B: ArithmeticBackend, R: CryptoRng + ?Sized>(
@@ -1362,8 +1408,39 @@ mod tests {
 
     #[test]
     fn default_options_search_the_full_table() {
-        assert_eq!(ProverOptions::default().max_class_number, 3);
+        assert_eq!(ProverOptions::default().max_class_number, 8);
         assert_eq!(ProverOptions::default().ecm_rounds, 1);
+        assert_eq!(ProverOptions::default().max_depth, 128);
+        assert_eq!(ProverOptions::default().search_budget, 8192);
+    }
+
+    #[test]
+    fn general_splitter_recovers_constructed_roots() {
+        let mut rng = StdRng::seed_from_u64(13);
+        let modulus = from_u64::<NumBigint>(1_000_003).unwrap();
+        let expected: [u64; 5] = [2, 3, 5, 7, 11];
+        // Expand prod (x - r) modulo the prime.
+        let mut polynomial = vec![one::<NumBigint>().unwrap()];
+        for root in expected {
+            let root = from_u64::<NumBigint>(root).unwrap();
+            let mut next = vec![zero::<NumBigint>().unwrap(); polynomial.len() + 1];
+            for (k, coefficient) in polynomial.iter().enumerate() {
+                next[k + 1] = ((next[k + 1].clone() + coefficient).unwrap() % &modulus).unwrap();
+                let term = modular_mul::<NumBigint>(coefficient, &root, &modulus).unwrap();
+                next[k] = modular_sub::<NumBigint>(&next[k], &term, &modulus).unwrap();
+            }
+            polynomial = next;
+        }
+        let mut attempts = 64u32;
+        let mut roots = Vec::new();
+        polynomial_roots::<NumBigint, _>(&modulus, polynomial, &mut rng, &mut attempts, &mut roots)
+            .unwrap();
+        let mut recovered: Vec<u64> = roots
+            .iter()
+            .map(|root| crate::arithmetic::to_u64::<NumBigint>(root).expect("small root"))
+            .collect();
+        recovered.sort_unstable();
+        assert_eq!(recovered, expected);
     }
 
     #[test]
@@ -1377,39 +1454,22 @@ mod tests {
     }
 
     #[test]
-    fn cubic_class_polynomial_splits_for_represented_primes() {
-        let cubic_entry = DISCRIMINANTS
+    fn class_polynomials_split_for_represented_primes() {
+        let entry = DISCRIMINANTS
             .iter()
             .find(|discriminant| discriminant.value == -23)
             .expect("table contains -23");
-        let ClassPolynomial::Cubic {
-            constant,
-            linear,
-            quadratic,
-        } = cubic_entry.polynomial
-        else {
-            panic!("-23 should be cubic");
-        };
+        assert_eq!(entry.polynomial.class_number(), 3);
 
         let mut rng = StdRng::seed_from_u64(5);
         // 4·59 = 12² + 23·2² and 4·101 = 6² + 23·4², so H₋₂₃ splits
         // completely modulo both primes.
         for prime in [59u64, 101] {
             let candidate = from_u64::<NumBigint>(prime).unwrap();
-            let polynomial = CubicPolynomial::<NumBigint>::new(
-                &candidate,
-                modular_signed::<NumBigint>(quadratic, &candidate).unwrap(),
-                modular_signed::<NumBigint>(linear, &candidate).unwrap(),
-                modular_signed::<NumBigint>(constant, &candidate).unwrap(),
-            )
-            .unwrap();
-            let roots = cubic_roots::<NumBigint, _>(&candidate, &polynomial, &mut rng)
+            let roots = j_invariants::<NumBigint, _>(&candidate, entry.polynomial, &mut rng)
                 .unwrap()
                 .unwrap();
             assert_eq!(roots.len(), 3, "prime {prime} should split completely");
-            for root in &roots {
-                assert!(polynomial.evaluate(&candidate, root).unwrap().is_zero());
-            }
         }
     }
 }

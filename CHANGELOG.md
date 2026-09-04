@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The CM discriminant table now covers every fundamental discriminant with
+  class number up to eight, generated with verified high-precision
+  arithmetic and stored as exact byte-encoded coefficients. The polynomial
+  root-finder generalizes from cubics to arbitrary degree by recursive
+  Cantor–Zassenhaus splitting in both engines.
+- Backtracking proof search: a failed level no longer abandons the proof.
+  Each level tries every available curve order, re-sweeps with fresh
+  randomness, and backtracks to alternate branches, bounded by the new
+  `ProverOptions::search_budget`. `Error::SearchExhausted` now reports the
+  original candidate rather than an internal intermediate.
+- Together, the enlarged table, backtracking, and ECM move the practical
+  proving envelope from roughly 512 bits to 1024 bits: a 1024-bit prime
+  that previously exhausted the search in minutes now proves with default
+  options in tens of minutes.
+
 - Twelve class-number-three CM discriminants (`-23` through `-547`) with
   exact cubic Hilbert class polynomials, plus a randomized Cantor–Zassenhaus
   cubic root-finder in both the generic engine and the allocation-free
@@ -26,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Both `ProverOptions` types gained a `search_budget` field bounding total
+  backtracking work. The heap prover's defaults changed: `max_class_number`
+  now covers the full table (eight) and `max_depth` rose to 128 so deep
+  descents are not cut short; the allocation-free prover keeps its
+  conservative defaults.
 - Both `ProverOptions` types gained an `ecm_rounds` field controlling ECM
   escalation (heap prover defaults to one round; the allocation-free prover
   defaults to zero so constrained targets never pay for it), and a

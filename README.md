@@ -77,16 +77,21 @@ rather than smooth curves.
 | 320 | 103 µs | 630 µs | 903 µs | 7.6 ms | 25 s | 69 s |
 | 384 | 157 µs | 825 µs | 1.4 ms | 6.8 ms | 82 s | 248 s |
 | 512 | 315 µs | 1.6 ms | 1.8 ms | 13 ms | 168 s | 456 s |
+| 1024 | 1.6 ms | 9.6 ms | 11.4 ms | 121 ms | 1475 s | 4227 s |
+
+The 1024-bit prove figures are steady across candidates: three distinct
+1024-bit primes proved in 1454–1550 seconds each on the rug engine, all
+producing 23-step certificates.
 
 Two things follow from the table. Verifying a stored certificate costs the
-same order of magnitude as re-running a strong probabilistic check, so the
-one-time proving cost buys checks that are nearly free thereafter. And the
-practical proving envelope of the current search bounds ends near 512 bits:
-distinct 512-bit candidates prove in minutes (generation retries past the
-occasional `Error::SearchExhausted`), while a 1024-bit attempt exhausts the
-bounded factor search after a few minutes. Probabilistic screening keeps
-going far beyond that — a 64-round GMP check costs roughly 10 ms at 1024
-bits and 3 s at 8192 bits.
+same order of magnitude as re-running a strong probabilistic check — about
+twelve 64-round GMP checks at 1024 bits — so the one-time proving cost buys
+checks that are nearly free thereafter. And the practical proving envelope
+of the current search bounds ends near 1024 bits: 512-bit candidates prove
+in minutes and 1024-bit candidates in under half an hour, while a 2048-bit
+attempt did not complete within a 45-minute cap. Probabilistic screening
+keeps going far beyond that — a 64-round GMP check costs roughly 67 ms at
+2048 bits and 3 s at 8192 bits.
 
 ## Installation
 
@@ -332,11 +337,12 @@ The prover constructs an Atkin–Morain ECPP chain. At each level it:
 6. Reduces the proof of `n` to a proof of the smaller `q`.
 7. Terminates at a 64-bit prime checked by deterministic Miller–Rabin.
 
-The CM search includes the `j = 0` and `j = 1728` supersingular cases, all
-fundamental imaginary quadratic discriminants of class number one and two, and
-the twelve class-number-three discriminants whose Hilbert class polynomial
-coefficients fit 128 bits. Cubic class polynomials are split modulo `n` with
-randomized Cantor–Zassenhaus factoring.
+The CM search includes the `j = 0` and `j = 1728` supersingular cases and
+every fundamental imaginary quadratic discriminant of class number up to
+eight. Class polynomials beyond degree two are split modulo `n` with
+randomized Cantor–Zassenhaus factoring, and the search backtracks: a level
+that dead-ends abandons only that branch of the descent, bounded overall by
+`ProverOptions::search_budget`.
 
 Each [`EcppStep`](https://docs.rs/ecpp/latest/ecpp/struct.EcppStep.html) records:
 
