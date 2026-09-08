@@ -1,4 +1,5 @@
 /// The largest class number in the embedded discriminant table.
+#[cfg(feature = "crypto-bigint")]
 pub(crate) const MAX_CLASS_NUMBER: usize = 8;
 
 /// A signed integer stored as a big-endian magnitude, used for Hilbert class
