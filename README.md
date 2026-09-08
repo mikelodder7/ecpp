@@ -78,20 +78,24 @@ rather than smooth curves.
 | 384 | 157 µs | 825 µs | 1.4 ms | 6.8 ms | 82 s | 248 s |
 | 512 | 315 µs | 1.6 ms | 1.8 ms | 13 ms | 168 s | 456 s |
 | 1024 | 1.6 ms | 9.6 ms | 11.4 ms | 121 ms | 1475 s | 4227 s |
+| 2048 | 16 ms | 89 ms | 111 ms | 677 ms | 52099 s | — |
 
 The 1024-bit prove figures are steady across candidates: three distinct
 1024-bit primes proved in 1454–1550 seconds each on the rug engine, all
-producing 23-step certificates.
+producing 23-step certificates. The 2048-bit figure is a single seeded
+search, run twice (14.5 and 15.2 hours): a 37-step certificate descending
+roughly 60 bits per step and consuming under a fifth of the default search
+budget. The resulting certificate is 59 KB of JSON and re-verifies in
+677 ms.
 
 Two things follow from the table. Verifying a stored certificate costs the
 same order of magnitude as re-running a strong probabilistic check — about
 twelve 64-round GMP checks at 1024 bits — so the one-time proving cost buys
 checks that are nearly free thereafter. And the practical proving envelope
-of the current search bounds ends near 1024 bits: 512-bit candidates prove
-in minutes and 1024-bit candidates in under half an hour, while a 2048-bit
-attempt did not complete within a 45-minute cap. Probabilistic screening
-keeps going far beyond that — a 64-round GMP check costs roughly 67 ms at
-2048 bits and 3 s at 8192 bits.
+of the current search bounds ends near 2048 bits: 512-bit candidates prove
+in minutes, 1024-bit candidates in under half an hour, and 2048-bit
+candidates overnight. Probabilistic screening keeps going far beyond that —
+a 64-round GMP check costs roughly 90 ms at 2048 bits and 3 s at 8192 bits.
 
 ## Installation
 

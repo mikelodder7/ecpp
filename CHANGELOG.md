@@ -5,56 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-08
 
 ### Added
 
-- The CM discriminant table now covers every fundamental discriminant with
-  class number up to eight, generated with verified high-precision
-  arithmetic and stored as exact byte-encoded coefficients. The polynomial
-  root-finder generalizes from cubics to arbitrary degree by recursive
-  Cantor–Zassenhaus splitting in both engines.
+- The CM discriminant table grew from class numbers one and two (25
+  entries) to every fundamental discriminant with class number up to eight
+  (333 entries), generated with verified high-precision arithmetic and
+  stored as exact byte-encoded coefficients. A randomized recursive
+  Cantor–Zassenhaus splitter finds roots of the higher-degree Hilbert
+  class polynomials in both the generic engine and the allocation-free
+  `fixed` module.
 - Backtracking proof search: a failed level no longer abandons the proof.
   Each level tries every available curve order, re-sweeps with fresh
   randomness, and backtracks to alternate branches, bounded by the new
   `ProverOptions::search_budget`. `Error::SearchExhausted` now reports the
   original candidate rather than an internal intermediate.
 - Together, the enlarged table, backtracking, and ECM move the practical
-  proving envelope from roughly 512 bits to 1024 bits: a 1024-bit prime
+  proving envelope from roughly 512 bits to 2048 bits: a 1024-bit prime
   that previously exhausted the search in minutes now proves with default
-  options in tens of minutes.
-
-- Twelve class-number-three CM discriminants (`-23` through `-547`) with
-  exact cubic Hilbert class polynomials, plus a randomized Cantor–Zassenhaus
-  cubic root-finder in both the generic engine and the allocation-free
-  `fixed` module. The enlarged search proves candidates that previously
-  returned `Error::SearchExhausted`; a 512-bit prime that exhausted the old
-  table now proves with default `ProverOptions`.
-- README guidance on when to use ECPP over probabilistic testing, with
-  measured proving, verification, and screening costs across input sizes.
+  options in tens of minutes, and a 2048-bit prime proves overnight
+  (one seeded search, run twice: 14.5 and 15.2 hours for the same 37-step
+  certificate, with under a fifth of the default search budget consumed).
 
 - Lenstra ECM (Montgomery x-only stage one with Suyama parameterization) as
   an escalating fallback when Pollard rho cannot split a curve-order
   cofactor of at least 384 bits, in both the generic engine and the
   allocation-free `fixed` module. This extends the reachable factor range
-  well beyond rho and is the first step toward proving 1024-bit candidates.
+  well beyond rho.
+- README guidance on when to use ECPP over probabilistic testing, with
+  measured proving, verification, and screening costs across input sizes.
 
 ### Changed
 
-- Both `ProverOptions` types gained a `search_budget` field bounding total
-  backtracking work. The heap prover's defaults changed: `max_class_number`
-  now covers the full table (eight) and `max_depth` rose to 128 so deep
-  descents are not cut short; the allocation-free prover keeps its
-  conservative defaults.
-- Both `ProverOptions` types gained an `ecm_rounds` field controlling ECM
-  escalation (heap prover defaults to one round; the allocation-free prover
-  defaults to zero so constrained targets never pay for it), and a
-  `max_class_number` field bounding
-  which CM discriminants are searched. The heap prover defaults to three
-  (the full table); the allocation-free prover defaults to two, so
-  constrained `no_std` targets skip cubic polynomial splitting unless they
-  opt in. Struct-literal constructions of `ProverOptions` must add the new
-  field.
+- **Breaking:** both `ProverOptions` types gained three fields —
+  `max_class_number` bounding which CM discriminants are searched,
+  `ecm_rounds` controlling ECM escalation, and `search_budget` bounding
+  total backtracking work — so struct-literal constructions must add them
+  (or use `..Default::default()`). The heap prover defaults to the full
+  table (class number eight), one ECM round, a budget of 8192, and a
+  `max_depth` of 128 so deep descents are not cut short. The
+  allocation-free prover keeps conservative defaults (class number two, no
+  ECM, budget 1024) so constrained `no_std` targets never pay for the
+  heavier search unless they opt in.
 
 ## [0.1.1] - 2026-09-03
 
